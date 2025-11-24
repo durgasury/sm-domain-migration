@@ -1,0 +1,4 @@
+# file: /Users/surydurg/Desktop/sm-domain-migration/scripts/utils/logging_config.py
+# hypothesis_version: 6.148.2
+
+['%Y-%m-%d %H:%M:%S', 'INFO']

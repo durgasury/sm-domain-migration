@@ -1,0 +1,819 @@
+# SageMaker Studio Domain Migration Tool
+
+A comprehensive Python-based tool for migrating AWS SageMaker Studio domains between AWS Organizations. This tool automates the process of capturing domain configurations, backing up user data, recreating the domain in a new organizational context, and restoring all data and configurations.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Migration Process](#migration-process)
+- [Script Reference](#script-reference)
+- [IAM Permissions](#iam-permissions)
+- [Limitations](#limitations)
+- [Troubleshooting](#troubleshooting)
+- [Monitoring and Validation](#monitoring-and-validation)
+
+## Overview
+
+When an AWS account moves between AWS Organizations, SSO-based SageMaker Studio domains break due to Identity Center instance changes. This tool provides an automated migration path by:
+
+1. **Discovering** all domain configurations, user profiles, and spaces
+2. **Backing up** user data from EBS volumes to S3
+3. **Recreating** the domain and all resources in the new organizational context
+4. **Retagging** SageMaker resources to reference the new domain
+5. **Restoring** user data from S3 back to the new domain
+
+## Prerequisites
+
+### Software Requirements
+
+- **Python**: Version 3.8 or higher
+- **boto3**: AWS SDK for Python (install via `pip install boto3`)
+- **AWS CLI**: Recommended for credential configuration
+
+### AWS Requirements
+
+- **AWS Credentials**: Configured with appropriate IAM permissions (see [IAM Permissions](#iam-permissions))
+- **S3 Bucket**: An S3 bucket for storing backup data during migration
+- **Identity Center**: Users must exist in the new Identity Center instance
+- **Network Access**: VPC, subnets, and security groups must be accessible in the target account
+
+### Supported Configurations
+
+- **Authentication Mode**: SSO (Single Sign-On) mode only
+- **App Types**: JupyterLab and CodeEditor
+- **Storage**: Default EFS volumes only
+
+## Installation
+
+1. Clone or download this repository:
+```bash
+git clone <repository-url>
+cd sagemaker-domain-migration
+```
+
+2. Install required Python packages:
+```bash
+pip install -r requirements.txt
+```
+
+3. Configure AWS credentials:
+```bash
+aws configure
+# Or use environment variables:
+# export AWS_ACCESS_KEY_ID=your_access_key
+# export AWS_SECRET_ACCESS_KEY=your_secret_key
+# export AWS_DEFAULT_REGION=your_region
+```
+
+4. Create an S3 bucket for backups:
+```bash
+aws s3 mb s3://your-backup-bucket-name
+```
+
+## Migration Process
+
+### Phase 1: Discovery
+
+Capture all configuration details of the existing SageMaker Studio domain.
+
+**Command:**
+```bash
+python scripts/discover_domain.py \
+  --domain-id d-xxxxxxxxxxxx \
+  --output-dir ./migration_data
+```
+
+**Parameters:**
+- `--domain-id` (required): The ID of the existing SageMaker Studio domain
+- `--output-dir` (optional): Directory to store configuration files (default: `./migration_data`)
+
+**Output Files:**
+- `migration_data/domain_config.json`: Domain configuration
+- `migration_data/user_profiles.json`: User profile configurations
+- `migration_data/spaces.json`: Space configurations
+
+**Example:**
+```bash
+python scripts/discover_domain.py --domain-id d-abc123def456
+```
+
+### Phase 2: Backup
+
+Sync user data from EBS volumes to S3 using lifecycle configurations.
+
+**Command:**
+```bash
+python scripts/backup_domain_data.py \
+  --domain-id d-xxxxxxxxxxxx \
+  --s3-bucket your-backup-bucket \
+  --s3-prefix sagemaker-migration \
+  --config-dir ./migration_data
+```
+
+**Parameters:**
+- `--domain-id` (required): The ID of the existing domain
+- `--s3-bucket` (required): S3 bucket name for backup storage
+- `--s3-prefix` (optional): S3 prefix for organizing backup data
+- `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
+
+**Output Files:**
+- `migration_data/backup_status.json`: Backup operation status and any failures
+
+**What This Does:**
+1. Creates lifecycle configurations that sync data to S3
+2. Attaches lifecycle configurations to the domain
+3. Restarts all active JupyterLab and CodeEditor apps
+4. Waits for apps to complete the backup process
+
+**Example:**
+```bash
+python scripts/backup_domain_data.py \
+  --domain-id d-abc123def456 \
+  --s3-bucket my-sagemaker-backups \
+  --s3-prefix migration-2025-11
+```
+
+**⚠️ Important:** This phase will restart all active apps. Users will be temporarily disconnected.
+
+### Phase 3: Account Migration
+
+**Manual Step:** Move your AWS account to the new AWS Organization using the AWS Organizations console or CLI. This step is performed outside of this tool.
+
+### Phase 4: Recreation
+
+Recreate the SageMaker Studio domain and all resources in the new organizational context.
+
+**Command:**
+```bash
+python scripts/recreate_domain.py \
+  --config-dir ./migration_data \
+  --new-domain-name my-studio-domain-new
+```
+
+**Parameters:**
+- `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
+- `--new-domain-name` (optional): Name for the new domain (default: original name with timestamp)
+
+**Output Files:**
+- `migration_data/recreation_mapping.json`: Mapping of old to new resource ARNs
+
+**What This Does:**
+1. Creates a new domain with the same configuration
+2. Creates Identity Center application assignments for all users
+3. Waits for automatic user profile creation
+4. Updates user profile settings to match original configurations
+5. Creates all spaces with original owners and settings
+6. Generates a mapping file for ARN translation
+
+**Example:**
+```bash
+python scripts/recreate_domain.py --new-domain-name studio-domain-prod
+```
+
+### Phase 5: Retagging
+
+Update tags on SageMaker resources to reference the new domain.
+
+**Command:**
+```bash
+python scripts/retag_resources.py \
+  --config-dir ./migration_data \
+  --old-domain-id d-xxxxxxxxxxxx \
+  --new-domain-id d-yyyyyyyyyyyy
+```
+
+**Parameters:**
+- `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
+- `--old-domain-id` (required): The ID of the original domain
+- `--new-domain-id` (required): The ID of the new domain
+
+**Output Files:**
+- `migration_data/retagging_status.json`: Retagging operation status
+
+**What This Does:**
+1. Identifies all SageMaker jobs, pipelines, and endpoints tagged with the old domain
+2. Updates tags to reference the new domain, user profiles, and spaces
+3. Uses the ARN mapping to translate old ARNs to new ARNs
+
+**Example:**
+```bash
+python scripts/retag_resources.py \
+  --old-domain-id d-abc123def456 \
+  --new-domain-id d-xyz789ghi012
+```
+
+### Phase 6: Restoration
+
+Restore user data from S3 back to the new domain.
+
+**Command:**
+```bash
+python scripts/restore_domain_data.py \
+  --domain-id d-yyyyyyyyyyyy \
+  --s3-bucket your-backup-bucket \
+  --s3-prefix sagemaker-migration \
+  --config-dir ./migration_data
+```
+
+**Parameters:**
+- `--domain-id` (required): The ID of the new domain
+- `--s3-bucket` (required): S3 bucket name containing backup data
+- `--s3-prefix` (optional): S3 prefix where backup data is stored
+- `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
+
+**Output Files:**
+- `migration_data/restoration_status.json`: Restoration operation status and any failures
+
+**What This Does:**
+1. Creates lifecycle configurations that sync data from S3
+2. Attaches lifecycle configurations to the new domain
+3. Starts apps for all spaces to trigger data restoration
+4. Waits for apps to complete the restoration process
+
+**Example:**
+```bash
+python scripts/restore_domain_data.py \
+  --domain-id d-xyz789ghi012 \
+  --s3-bucket my-sagemaker-backups \
+  --s3-prefix migration-2025-11
+```
+
+## Script Reference
+
+### discover_domain.py
+
+Captures all configuration details of an existing SageMaker Studio domain.
+
+**Usage:**
+```bash
+python scripts/discover_domain.py --domain-id <domain-id> [--output-dir <path>]
+```
+
+**Required IAM Permissions:**
+- `sagemaker:DescribeDomain`
+- `sagemaker:ListUserProfiles`
+- `sagemaker:DescribeUserProfile`
+- `sagemaker:ListSpaces`
+- `sagemaker:DescribeSpace`
+
+### backup_domain_data.py
+
+Creates lifecycle configurations to backup user data to S3 and restarts apps.
+
+**Usage:**
+```bash
+python scripts/backup_domain_data.py \
+  --domain-id <domain-id> \
+  --s3-bucket <bucket-name> \
+  [--s3-prefix <prefix>] \
+  [--config-dir <path>]
+```
+
+**Required IAM Permissions:**
+- `sagemaker:CreateStudioLifecycleConfig`
+- `sagemaker:UpdateDomain`
+- `sagemaker:ListApps`
+- `sagemaker:DescribeApp`
+- `sagemaker:DeleteApp`
+- `sagemaker:CreateApp`
+- `s3:PutObject`
+- `s3:GetObject`
+- `s3:ListBucket`
+
+### recreate_domain.py
+
+Recreates the domain, user profiles, and spaces in the new organizational context.
+
+**Usage:**
+```bash
+python scripts/recreate_domain.py \
+  [--config-dir <path>] \
+  [--new-domain-name <name>]
+```
+
+**Required IAM Permissions:**
+- `sagemaker:CreateDomain`
+- `sagemaker:DescribeDomain`
+- `sagemaker:DescribeUserProfile`
+- `sagemaker:UpdateUserProfile`
+- `sagemaker:CreateSpace`
+- `sagemaker:DescribeSpace`
+- `sso-admin:ListApplications`
+- `sso-admin:CreateApplicationAssignment`
+- `identitystore:ListUsers`
+- `iam:PassRole`
+
+### retag_resources.py
+
+Updates tags on SageMaker resources to reference the new domain.
+
+**Usage:**
+```bash
+python scripts/retag_resources.py \
+  --old-domain-id <old-id> \
+  --new-domain-id <new-id> \
+  [--config-dir <path>]
+```
+
+**Required IAM Permissions:**
+- `sagemaker:ListTrainingJobs`
+- `sagemaker:DescribeTrainingJob`
+- `sagemaker:ListPipelines`
+- `sagemaker:DescribePipeline`
+- `sagemaker:ListEndpoints`
+- `sagemaker:DescribeEndpoint`
+- `sagemaker:ListTags`
+- `sagemaker:AddTags`
+- `sagemaker:DeleteTags`
+
+### restore_domain_data.py
+
+Creates lifecycle configurations to restore user data from S3 and starts all spaces.
+
+**Usage:**
+```bash
+python scripts/restore_domain_data.py \
+  --domain-id <domain-id> \
+  --s3-bucket <bucket-name> \
+  [--s3-prefix <prefix>] \
+  [--config-dir <path>]
+```
+
+**Required IAM Permissions:**
+- `sagemaker:CreateStudioLifecycleConfig`
+- `sagemaker:UpdateDomain`
+- `sagemaker:CreateApp`
+- `sagemaker:DescribeApp`
+- `s3:GetObject`
+- `s3:ListBucket`
+
+## IAM Permissions
+
+### Minimum Required Permissions by Phase
+
+#### Discovery Phase
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:DescribeDomain",
+        "sagemaker:ListUserProfiles",
+        "sagemaker:DescribeUserProfile",
+        "sagemaker:ListSpaces",
+        "sagemaker:DescribeSpace"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+#### Backup Phase
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:CreateStudioLifecycleConfig",
+        "sagemaker:UpdateDomain",
+        "sagemaker:ListApps",
+        "sagemaker:DescribeApp",
+        "sagemaker:DeleteApp",
+        "sagemaker:CreateApp"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::backup-bucket-name",
+        "arn:aws:s3:::backup-bucket-name/*"
+      ]
+    }
+  ]
+}
+```
+
+#### Recreation Phase
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:CreateDomain",
+        "sagemaker:DescribeDomain",
+        "sagemaker:DescribeUserProfile",
+        "sagemaker:UpdateUserProfile",
+        "sagemaker:CreateSpace",
+        "sagemaker:DescribeSpace"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sso-admin:ListApplications",
+        "sso-admin:CreateApplicationAssignment",
+        "identitystore:ListUsers"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": "arn:aws:iam::*:role/*SageMaker*"
+    }
+  ]
+}
+```
+
+#### Retagging Phase
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:ListTrainingJobs",
+        "sagemaker:DescribeTrainingJob",
+        "sagemaker:ListPipelines",
+        "sagemaker:DescribePipeline",
+        "sagemaker:ListEndpoints",
+        "sagemaker:DescribeEndpoint",
+        "sagemaker:ListTags",
+        "sagemaker:AddTags",
+        "sagemaker:DeleteTags"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+#### Restoration Phase
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:CreateStudioLifecycleConfig",
+        "sagemaker:UpdateDomain",
+        "sagemaker:CreateApp",
+        "sagemaker:DescribeApp"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::backup-bucket-name",
+        "arn:aws:s3:::backup-bucket-name/*"
+      ]
+    }
+  ]
+}
+```
+
+### Consolidated IAM Policy
+
+A single IAM policy combining all required permissions for the entire migration process:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SageMakerDomainMigration",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:DescribeDomain",
+        "sagemaker:CreateDomain",
+        "sagemaker:UpdateDomain",
+        "sagemaker:ListUserProfiles",
+        "sagemaker:DescribeUserProfile",
+        "sagemaker:UpdateUserProfile",
+        "sagemaker:ListSpaces",
+        "sagemaker:DescribeSpace",
+        "sagemaker:CreateSpace",
+        "sagemaker:ListApps",
+        "sagemaker:DescribeApp",
+        "sagemaker:CreateApp",
+        "sagemaker:DeleteApp",
+        "sagemaker:CreateStudioLifecycleConfig",
+        "sagemaker:ListTrainingJobs",
+        "sagemaker:DescribeTrainingJob",
+        "sagemaker:ListPipelines",
+        "sagemaker:DescribePipeline",
+        "sagemaker:ListEndpoints",
+        "sagemaker:DescribeEndpoint",
+        "sagemaker:ListTags",
+        "sagemaker:AddTags",
+        "sagemaker:DeleteTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IdentityCenterAccess",
+      "Effect": "Allow",
+      "Action": [
+        "sso-admin:ListApplications",
+        "sso-admin:CreateApplicationAssignment",
+        "identitystore:ListUsers"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3BackupAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::backup-bucket-name",
+        "arn:aws:s3:::backup-bucket-name/*"
+      ]
+    },
+    {
+      "Sid": "IAMPassRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": "arn:aws:iam::*:role/*SageMaker*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "sagemaker.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Note:** Replace `backup-bucket-name` with your actual S3 bucket name.
+
+## Limitations
+
+### Unsupported Application Types
+
+This migration tool **does not support** the following SageMaker Studio application types:
+
+- **Canvas Applications**: SageMaker Canvas apps are not supported and will not be migrated
+- **Data Wrangler Applications**: Data Wrangler apps are not supported and will not be migrated
+- **RStudio Applications**: RStudio apps are not supported and will not be migrated
+
+**Workaround:** These applications must be manually recreated in the new domain after migration.
+
+### Unsupported Storage Configurations
+
+- **Custom File Systems**: Only default EFS volumes are supported. Custom file systems attached to the domain are not migrated
+- **Large EFS Volumes**: EFS volumes containing multiple gigabytes of data may cause S3 sync failures in lifecycle configurations due to the 5-minute execution time limit
+
+**Workaround for Large Volumes:**
+- Use AWS DataSync for large data transfers
+- Use EFS-to-EFS replication
+- Manually copy data using EC2 instances with EFS mounted
+
+### Other Limitations
+
+- **Authentication Mode**: Only SSO (Single Sign-On) mode is supported. IAM mode domains are not supported
+- **Identity Center Requirement**: User identities must exist in the new Identity Center instance before recreation
+- **Manual Organization Migration**: The AWS account must be manually moved between organizations
+- **Lifecycle Configuration Timeout**: Startup scripts have a 5-minute execution limit, which may not be sufficient for very large data volumes
+
+## Troubleshooting
+
+### Common Issues and Solutions
+
+#### Issue: "Domain not found" error during discovery
+
+**Cause:** The domain ID is incorrect or the domain doesn't exist in the current region.
+
+**Solution:**
+1. Verify the domain ID is correct: `aws sagemaker list-domains`
+2. Ensure you're using the correct AWS region: `aws configure get region`
+3. Check that your credentials have access to the domain
+
+#### Issue: Apps fail to restart during backup phase
+
+**Cause:** Apps may be in a transitional state or have configuration issues.
+
+**Solution:**
+1. Check the `backup_status.json` file for specific error messages
+2. Manually delete stuck apps: `aws sagemaker delete-app --domain-id <id> --user-profile-name <name> --app-type <type> --app-name <name>`
+3. Wait a few minutes and retry the backup script
+4. If persistent, check CloudWatch logs for the app
+
+#### Issue: S3 sync fails in lifecycle configuration
+
+**Cause:** The EFS volume contains too much data to sync within the 5-minute timeout.
+
+**Solution:**
+1. Use AWS DataSync instead of lifecycle configurations for large data transfers
+2. Reduce the amount of data by cleaning up unnecessary files
+3. Exclude large directories from the sync using `--exclude` patterns
+
+#### Issue: User profiles not created automatically after application assignment
+
+**Cause:** There may be a delay in SageMaker's automatic user profile creation process.
+
+**Solution:**
+1. Wait 5-10 minutes for the automatic creation process
+2. Check Identity Center to ensure the user assignment was successful
+3. Verify the user exists in the new Identity Center instance
+4. Manually create the user profile if automatic creation fails after 15 minutes
+
+#### Issue: "Access Denied" errors during recreation
+
+**Cause:** Insufficient IAM permissions or the execution role doesn't exist in the new account.
+
+**Solution:**
+1. Verify your IAM permissions match the [consolidated policy](#consolidated-iam-policy)
+2. Ensure the domain execution role exists in the target account
+3. Check that the `iam:PassRole` permission is configured correctly
+4. Verify the execution role trust policy allows SageMaker to assume it
+
+#### Issue: Tags not updating on resources
+
+**Cause:** Resources may not have the expected tags or the ARN mapping is incomplete.
+
+**Solution:**
+1. Check the `recreation_mapping.json` file to verify ARN mappings
+2. Manually verify tags on resources: `aws sagemaker list-tags --resource-arn <arn>`
+3. Ensure the old domain ID is correct in the retag command
+4. Check CloudWatch logs for specific API errors
+
+#### Issue: Data not restored to new domain
+
+**Cause:** S3 paths may be incorrect or lifecycle configurations not executing.
+
+**Solution:**
+1. Verify the S3 bucket and prefix are correct
+2. Check that data exists in S3: `aws s3 ls s3://bucket/prefix/`
+3. Review CloudWatch logs for lifecycle configuration execution
+4. Manually start an app and check `/var/log/studio/` for lifecycle logs
+5. Verify the lifecycle configuration is attached to the domain
+
+### Checking Logs
+
+#### SageMaker Logs
+```bash
+# List log groups
+aws logs describe-log-groups --log-group-name-prefix /aws/sagemaker
+
+# View lifecycle configuration logs
+aws logs tail /aws/sagemaker/studio/lifecycle-config --follow
+```
+
+#### Script Logs
+
+All scripts output logs to the console. To save logs to a file:
+```bash
+python scripts/discover_domain.py --domain-id d-xxx 2>&1 | tee discovery.log
+```
+
+### Getting Help
+
+If you encounter issues not covered in this troubleshooting section:
+
+1. Check the status JSON files in the `migration_data` directory for detailed error messages
+2. Review AWS CloudWatch logs for SageMaker and lifecycle configurations
+3. Verify all prerequisites are met
+4. Ensure IAM permissions are correctly configured
+5. Test the migration process in a non-production environment first
+
+## Monitoring and Validation
+
+### During Migration
+
+Monitor the migration process by:
+
+1. **Checking Status Files**: Each script generates a status JSON file in the `migration_data` directory
+   ```bash
+   cat migration_data/backup_status.json
+   cat migration_data/recreation_mapping.json
+   cat migration_data/retagging_status.json
+   cat migration_data/restoration_status.json
+   ```
+
+2. **Monitoring AWS Console**: Watch the SageMaker console for:
+   - Domain creation progress
+   - User profile creation
+   - Space creation
+   - App status changes
+
+3. **Checking CloudWatch Logs**: Monitor lifecycle configuration execution
+   ```bash
+   aws logs tail /aws/sagemaker/studio/lifecycle-config --follow
+   ```
+
+### Post-Migration Validation
+
+After completing the migration, validate the new domain:
+
+#### 1. Verify Domain Configuration
+```bash
+aws sagemaker describe-domain --domain-id d-yyyyyyyyyyyy
+```
+
+Check that:
+- VPC, subnets, and security groups match the original
+- Lifecycle configurations are attached
+- Custom images are registered
+
+#### 2. Verify User Profiles
+```bash
+aws sagemaker list-user-profiles --domain-id d-yyyyyyyyyyyy
+```
+
+Check that:
+- All user profiles exist
+- Execution roles are correct
+- User settings match the original
+
+#### 3. Verify Spaces
+```bash
+aws sagemaker list-spaces --domain-id d-yyyyyyyyyyyy
+```
+
+Check that:
+- All spaces exist
+- Owners are correct
+- Sharing settings match the original
+
+#### 4. Verify Data Restoration
+
+Have users log in to SageMaker Studio and verify:
+- All files and directories are present
+- File permissions are correct
+- No data corruption occurred
+
+#### 5. Verify Resource Tags
+```bash
+# Check a training job
+aws sagemaker describe-training-job --training-job-name <job-name>
+
+# Check an endpoint
+aws sagemaker describe-endpoint --endpoint-name <endpoint-name>
+```
+
+Verify that tags reference the new domain ID and ARNs.
+
+#### 6. Test Functionality
+
+Perform basic functionality tests:
+- Start a JupyterLab app
+- Create a new notebook
+- Run a simple training job
+- Access existing endpoints
+
+### Rollback Considerations
+
+- **Before Recreation**: The original domain still exists; no rollback needed
+- **After Recreation**: Both domains exist temporarily; you can revert to the original if issues are found
+- **After Deletion**: No automated rollback; rely on S3 backups for data recovery
+
+**Best Practice:** Keep the original domain for at least 7 days after successful migration to ensure all functionality is working correctly in the new domain.
+
+## Best Practices
+
+1. **Test First**: Always test the migration process in a non-production environment before migrating production domains
+2. **Communicate**: Notify users before starting the migration, especially during backup and restoration phases when apps will be restarted
+3. **Backup Verification**: After the backup phase, verify that data exists in S3 before deleting the original domain
+4. **Incremental Validation**: Validate each phase before proceeding to the next
+5. **Keep Logs**: Save all script output and status files for troubleshooting
+6. **Monitor Costs**: Be aware of S3 storage costs for backups and data transfer costs
+7. **Clean Up**: After successful migration and validation, clean up S3 backups and delete the old domain to avoid unnecessary costs
+
+## Support
+
+For issues, questions, or contributions, please refer to the project repository or contact your AWS support team.
+
+## License
+
+[Add your license information here]

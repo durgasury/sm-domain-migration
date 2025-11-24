@@ -1,0 +1,4 @@
+# file: /Users/surydurg/Desktop/sm-domain-migration/scripts/utils/aws_clients.py
+# hypothesis_version: 6.148.2
+
+['adaptive', 'iam', 'identitystore', 'max_attempts', 'mode', 's3', 'sagemaker', 'sso-admin']

@@ -1,0 +1,4 @@
+# file: /Users/surydurg/Desktop/sm-domain-migration/scripts/discover_domain.py
+# hypothesis_version: 6.148.2
+
+['--domain-id', '--log-level', '--output-dir', './migration_data', '=', 'CreationTime', 'DEBUG', 'ERROR', 'FailureReason', 'INFO', 'LastModifiedTime', 'NextToken', 'ResponseMetadata', 'SpaceName', 'Spaces', 'Status', 'Url', 'UserProfileName', 'UserProfiles', 'WARNING', '__main__', 'd-', 'domain_config.json', 'spaces.json', 'user_profiles.json']

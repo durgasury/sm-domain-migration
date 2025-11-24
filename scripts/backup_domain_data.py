@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""
+Backup Script for SageMaker Domain Migration
+
+This script creates lifecycle configurations to sync user data to S3,
+attaches them to the domain, and restarts all active apps to trigger the backup.
+
+Usage:
+    python backup_domain_data.py --domain-id <domain-id> --s3-bucket <bucket> [--s3-prefix <prefix>] [--config-dir <path>]
+"""
+
+import argparse
+import sys
+import time
+import base64
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime
+
+from utils import (
+    get_sagemaker_client,
+    setup_logging,
+    get_logger,
+    save_json,
+    load_json
+)
+
+logger = get_logger(__name__)
+
+
+def generate_backup_lifecycle_script(s3_bucket: str, s3_prefix: str) -> str:
+    """
+    Generate lifecycle configuration script for backing up data to S3
+    
+    Args:
+        s3_bucket: S3 bucket name
+        s3_prefix: S3 prefix (optional)
+        
+    Returns:
+        Bash script content as string
+    """
+    script = f"""#!/bin/bash
+set -e
+
+# Get user profile and space information from environment
+USER_PROFILE_NAME=${{SAGEMAKER_USER_PROFILE_NAME:-"unknown"}}
+SPACE_NAME=${{SAGEMAKER_SPACE_NAME:-"unknown"}}
+
+# Construct S3 path
+S3_BUCKET="{s3_bucket}"
+S3_PREFIX="{s3_prefix}"
+
+# Build full S3 path with user profile and space
+if [ -n "$S3_PREFIX" ] && [ "$S3_PREFIX" != "" ]; then
+    S3_PATH="s3://${{S3_BUCKET}}/${{S3_PREFIX}}/${{USER_PROFILE_NAME}}/${{SPACE_NAME}}"
+else
+    S3_PATH="s3://${{S3_BUCKET}}/${{USER_PROFILE_NAME}}/${{SPACE_NAME}}"
+fi
+
+echo "Starting backup to $S3_PATH"
+
+# Sync user data to S3, excluding cache directories
+aws s3 sync /home/sagemaker-user "$S3_PATH" --exclude ".cache/*" --exclude "lost+found/*"
+
+echo "Backup completed successfully"
+"""
+    return script
+
+
+def create_lifecycle_config(
+    sagemaker_client,
+    app_type: str,
+    s3_bucket: str,
+    s3_prefix: str
+) -> str:
+    """
+    Create a Studio lifecycle configuration for backup
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        app_type: App type (JupyterLab or CodeEditor)
+        s3_bucket: S3 bucket name
+        s3_prefix: S3 prefix
+        
+    Returns:
+        Lifecycle configuration ARN
+    """
+    try:
+        lcc_name = f"backup-{app_type.lower()}-{int(time.time())}"
+        script_content = generate_backup_lifecycle_script(s3_bucket, s3_prefix)
+        
+        # Encode script in base64
+        script_encoded = base64.b64encode(script_content.encode('utf-8')).decode('utf-8')
+        
+        logger.info(f"Creating lifecycle configuration: {lcc_name}")
+        
+        response = sagemaker_client.create_studio_lifecycle_config(
+            StudioLifecycleConfigName=lcc_name,
+            StudioLifecycleConfigContent=script_encoded,
+            StudioLifecycleConfigAppType=app_type
+        )
+        
+        lcc_arn = response['StudioLifecycleConfigArn']
+        logger.info(f"Created lifecycle configuration: {lcc_arn}")
+        
+        return lcc_arn
+        
+    except Exception as e:
+        logger.error(f"Failed to create lifecycle configuration for {app_type}: {str(e)}")
+        raise
+
+
+def attach_lifecycle_config_to_domain(
+    sagemaker_client,
+    domain_id: str,
+    jupyterlab_lcc_arn: str,
+    codeeditor_lcc_arn: str
+) -> None:
+    """
+    Attach lifecycle configurations to domain default user settings
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        domain_id: SageMaker domain ID
+        jupyterlab_lcc_arn: JupyterLab lifecycle config ARN
+        codeeditor_lcc_arn: CodeEditor lifecycle config ARN
+    """
+    try:
+        logger.info(f"Attaching lifecycle configurations to domain {domain_id}")
+        
+        # Get current domain settings
+        domain_response = sagemaker_client.describe_domain(DomainId=domain_id)
+        default_user_settings = domain_response.get('DefaultUserSettings', {})
+        
+        # Update JupyterLab settings
+        jupyter_settings = default_user_settings.get('JupyterLabAppSettings', {})
+        jupyter_lcc_arns = jupyter_settings.get('LifecycleConfigArns', [])
+        if jupyterlab_lcc_arn not in jupyter_lcc_arns:
+            jupyter_lcc_arns.append(jupyterlab_lcc_arn)
+        jupyter_settings['LifecycleConfigArns'] = jupyter_lcc_arns
+        default_user_settings['JupyterLabAppSettings'] = jupyter_settings
+        
+        # Update CodeEditor settings
+        codeeditor_settings = default_user_settings.get('CodeEditorAppSettings', {})
+        codeeditor_lcc_arns = codeeditor_settings.get('LifecycleConfigArns', [])
+        if codeeditor_lcc_arn not in codeeditor_lcc_arns:
+            codeeditor_lcc_arns.append(codeeditor_lcc_arn)
+        codeeditor_settings['LifecycleConfigArns'] = codeeditor_lcc_arns
+        default_user_settings['CodeEditorAppSettings'] = codeeditor_settings
+        
+        # Update domain
+        sagemaker_client.update_domain(
+            DomainId=domain_id,
+            DefaultUserSettings=default_user_settings
+        )
+        
+        logger.info("Successfully attached lifecycle configurations to domain")
+        
+    except Exception as e:
+        logger.error(f"Failed to attach lifecycle configurations: {str(e)}")
+        raise
+
+
+def list_active_apps(sagemaker_client, domain_id: str) -> List[Dict[str, Any]]:
+    """
+    List all active JupyterLab and CodeEditor apps in the domain
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        domain_id: SageMaker domain ID
+        
+    Returns:
+        List of app dictionaries with details
+    """
+    try:
+        logger.info(f"Listing active apps for domain {domain_id}")
+        apps = []
+        next_token = None
+        
+        while True:
+            if next_token:
+                response = sagemaker_client.list_apps(
+                    DomainIdEquals=domain_id,
+                    NextToken=next_token
+                )
+            else:
+                response = sagemaker_client.list_apps(
+                    DomainIdEquals=domain_id
+                )
+            
+            for app in response.get('Apps', []):
+                # Filter for JupyterLab and CodeEditor apps that are InService
+                if app['AppType'] in ['JupyterLab', 'CodeEditor'] and app['Status'] == 'InService':
+                    apps.append({
+                        'DomainId': app['DomainId'],
+                        'UserProfileName': app.get('UserProfileName'),
+                        'SpaceName': app.get('SpaceName'),
+                        'AppType': app['AppType'],
+                        'AppName': app['AppName']
+                    })
+            
+            next_token = response.get('NextToken')
+            if not next_token:
+                break
+        
+        logger.info(f"Found {len(apps)} active JupyterLab/CodeEditor apps")
+        return apps
+        
+    except Exception as e:
+        logger.error(f"Failed to list active apps: {str(e)}")
+        raise
+
+
+def wait_for_app_deleted(
+    sagemaker_client,
+    domain_id: str,
+    user_profile_name: Optional[str],
+    space_name: Optional[str],
+    app_type: str,
+    app_name: str,
+    max_wait_seconds: int = 600
+) -> bool:
+    """
+    Wait for an app to be deleted
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        domain_id: SageMaker domain ID
+        user_profile_name: User profile name (for user profile apps)
+        space_name: Space name (for space apps)
+        app_type: App type
+        app_name: App name
+        max_wait_seconds: Maximum time to wait in seconds
+        
+    Returns:
+        True if app is deleted, False if timeout
+    """
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait_seconds:
+        try:
+            kwargs = {
+                'DomainId': domain_id,
+                'AppType': app_type,
+                'AppName': app_name
+            }
+            
+            if user_profile_name:
+                kwargs['UserProfileName'] = user_profile_name
+            if space_name:
+                kwargs['SpaceName'] = space_name
+            
+            response = sagemaker_client.describe_app(**kwargs)
+            status = response['Status']
+            
+            if status == 'Deleted':
+                return True
+            
+            logger.debug(f"App {app_name} status: {status}, waiting...")
+            time.sleep(10)
+            
+        except sagemaker_client.exceptions.ResourceNotFound:
+            # App is deleted
+            return True
+        except Exception as e:
+            logger.warning(f"Error checking app status: {str(e)}")
+            time.sleep(10)
+    
+    return False
+
+
+def wait_for_app_ready(
+    sagemaker_client,
+    domain_id: str,
+    user_profile_name: Optional[str],
+    space_name: Optional[str],
+    app_type: str,
+    app_name: str,
+    max_wait_seconds: int = 600
+) -> bool:
+    """
+    Wait for an app to reach InService status
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        domain_id: SageMaker domain ID
+        user_profile_name: User profile name (for user profile apps)
+        space_name: Space name (for space apps)
+        app_type: App type
+        app_name: App name
+        max_wait_seconds: Maximum time to wait in seconds
+        
+    Returns:
+        True if app is ready, False if timeout or failed
+    """
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait_seconds:
+        try:
+            kwargs = {
+                'DomainId': domain_id,
+                'AppType': app_type,
+                'AppName': app_name
+            }
+            
+            if user_profile_name:
+                kwargs['UserProfileName'] = user_profile_name
+            if space_name:
+                kwargs['SpaceName'] = space_name
+            
+            response = sagemaker_client.describe_app(**kwargs)
+            status = response['Status']
+            
+            if status == 'InService':
+                return True
+            elif status in ['Failed', 'Deleted']:
+                logger.error(f"App {app_name} entered {status} state")
+                return False
+            
+            logger.debug(f"App {app_name} status: {status}, waiting...")
+            time.sleep(15)
+            
+        except Exception as e:
+            logger.warning(f"Error checking app status: {str(e)}")
+            time.sleep(15)
+    
+    logger.error(f"Timeout waiting for app {app_name} to be ready")
+    return False
+
+
+def restart_app(
+    sagemaker_client,
+    app_info: Dict[str, Any]
+) -> Tuple[bool, Optional[str]]:
+    """
+    Restart an app by deleting and recreating it
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        app_info: App information dictionary
+        
+    Returns:
+        Tuple of (success: bool, error_message: Optional[str])
+    """
+    domain_id = app_info['DomainId']
+    user_profile_name = app_info.get('UserProfileName')
+    space_name = app_info.get('SpaceName')
+    app_type = app_info['AppType']
+    app_name = app_info['AppName']
+    
+    try:
+        # Build identifier for logging
+        if space_name:
+            identifier = f"{space_name}/{app_type}/{app_name}"
+        else:
+            identifier = f"{user_profile_name}/{app_type}/{app_name}"
+        
+        logger.info(f"Restarting app: {identifier}")
+        
+        # Delete the app
+        delete_kwargs = {
+            'DomainId': domain_id,
+            'AppType': app_type,
+            'AppName': app_name
+        }
+        
+        if user_profile_name:
+            delete_kwargs['UserProfileName'] = user_profile_name
+        if space_name:
+            delete_kwargs['SpaceName'] = space_name
+        
+        sagemaker_client.delete_app(**delete_kwargs)
+        logger.info(f"Initiated deletion of app: {identifier}")
+        
+        # Wait for deletion to complete
+        if not wait_for_app_deleted(
+            sagemaker_client, domain_id, user_profile_name, space_name, app_type, app_name
+        ):
+            error_msg = f"Timeout waiting for app deletion: {identifier}"
+            logger.error(error_msg)
+            return False, error_msg
+        
+        logger.info(f"App deleted successfully: {identifier}")
+        
+        # Recreate the app
+        create_kwargs = {
+            'DomainId': domain_id,
+            'AppType': app_type,
+            'AppName': app_name
+        }
+        
+        if user_profile_name:
+            create_kwargs['UserProfileName'] = user_profile_name
+        if space_name:
+            create_kwargs['SpaceName'] = space_name
+        
+        sagemaker_client.create_app(**create_kwargs)
+        logger.info(f"Initiated creation of app: {identifier}")
+        
+        # Wait for app to be ready
+        if not wait_for_app_ready(
+            sagemaker_client, domain_id, user_profile_name, space_name, app_type, app_name
+        ):
+            error_msg = f"App failed to start or timed out: {identifier}"
+            logger.error(error_msg)
+            return False, error_msg
+        
+        logger.info(f"App restarted successfully: {identifier}")
+        return True, None
+        
+    except Exception as e:
+        error_msg = f"Failed to restart app: {str(e)}"
+        logger.error(error_msg)
+        return False, error_msg
+
+
+def backup_domain_data(
+    domain_id: str,
+    s3_bucket: str,
+    s3_prefix: str,
+    config_dir: str
+) -> None:
+    """
+    Main backup function to sync user data to S3
+    
+    Args:
+        domain_id: SageMaker domain ID
+        s3_bucket: S3 bucket name for backup
+        s3_prefix: S3 prefix for backup
+        config_dir: Directory containing configuration files
+    """
+    # Initialize AWS client
+    sagemaker_client = get_sagemaker_client()
+    
+    # Create output directory
+    output_path = Path(config_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    logger.info("=" * 60)
+    logger.info("Starting domain backup process")
+    logger.info("=" * 60)
+    logger.info(f"Domain ID: {domain_id}")
+    logger.info(f"S3 Bucket: {s3_bucket}")
+    logger.info(f"S3 Prefix: {s3_prefix}")
+    logger.info("=" * 60)
+    
+    # Create lifecycle configurations
+    logger.info("Creating lifecycle configurations...")
+    jupyterlab_lcc_arn = create_lifecycle_config(
+        sagemaker_client, 'JupyterLab', s3_bucket, s3_prefix
+    )
+    codeeditor_lcc_arn = create_lifecycle_config(
+        sagemaker_client, 'CodeEditor', s3_bucket, s3_prefix
+    )
+    
+    # Attach lifecycle configurations to domain
+    attach_lifecycle_config_to_domain(
+        sagemaker_client, domain_id, jupyterlab_lcc_arn, codeeditor_lcc_arn
+    )
+    
+    # List active apps
+    active_apps = list_active_apps(sagemaker_client, domain_id)
+    
+    if not active_apps:
+        logger.warning("No active JupyterLab or CodeEditor apps found")
+        logger.info("Backup lifecycle configurations have been attached to the domain")
+        logger.info("Apps will sync data to S3 when they are next started")
+    else:
+        # Restart all active apps
+        logger.info(f"Restarting {len(active_apps)} active apps...")
+        
+        failed_apps = []
+        successful_count = 0
+        
+        for app_info in active_apps:
+            success, error = restart_app(sagemaker_client, app_info)
+            
+            if success:
+                successful_count += 1
+            else:
+                failed_apps.append({
+                    'user_profile_name': app_info.get('UserProfileName'),
+                    'space_name': app_info.get('SpaceName'),
+                    'app_type': app_info['AppType'],
+                    'app_name': app_info['AppName'],
+                    'error': error
+                })
+        
+        # Save backup status
+        backup_status = {
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'domain_id': domain_id,
+            's3_bucket': s3_bucket,
+            's3_prefix': s3_prefix,
+            'jupyterlab_lcc_arn': jupyterlab_lcc_arn,
+            'codeeditor_lcc_arn': codeeditor_lcc_arn,
+            'total_apps': len(active_apps),
+            'successful_apps': successful_count,
+            'failed_apps': failed_apps
+        }
+        
+        status_file = output_path / "backup_status.json"
+        save_json(backup_status, str(status_file))
+        
+        # Summary
+        logger.info("=" * 60)
+        logger.info("Backup process completed")
+        logger.info("=" * 60)
+        logger.info(f"Total apps: {len(active_apps)}")
+        logger.info(f"Successfully restarted: {successful_count}")
+        logger.info(f"Failed: {len(failed_apps)}")
+        
+        if failed_apps:
+            logger.error("=" * 60)
+            logger.error("FAILED APPS:")
+            for failed_app in failed_apps:
+                location = failed_app.get('space_name') or failed_app.get('user_profile_name')
+                logger.error(f"  - {location}/{failed_app['app_type']}/{failed_app['app_name']}")
+                logger.error(f"    Error: {failed_app['error']}")
+            logger.error("=" * 60)
+            
+            # Fail the backup process if any apps failed
+            raise RuntimeError(
+                f"Backup process failed: {len(failed_apps)} app(s) failed to restart. "
+                "Please check the logs and backup_status.json for details."
+            )
+        
+        logger.info(f"Backup status saved to: {status_file}")
+        logger.info("=" * 60)
+
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(
+        description="Backup SageMaker Studio domain data to S3"
+    )
+    parser.add_argument(
+        '--domain-id',
+        required=True,
+        help='SageMaker domain ID (e.g., d-xxxxxxxxxxxx)'
+    )
+    parser.add_argument(
+        '--s3-bucket',
+        required=True,
+        help='S3 bucket name for backup'
+    )
+    parser.add_argument(
+        '--s3-prefix',
+        default='',
+        help='S3 prefix for backup (optional)'
+    )
+    parser.add_argument(
+        '--config-dir',
+        default='./migration_data',
+        help='Directory for configuration files (default: ./migration_data)'
+    )
+    parser.add_argument(
+        '--log-level',
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        help='Logging level (default: INFO)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(level=args.log_level)
+    
+    try:
+        backup_domain_data(
+            args.domain_id,
+            args.s3_bucket,
+            args.s3_prefix,
+            args.config_dir
+        )
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Backup failed: {str(e)}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
