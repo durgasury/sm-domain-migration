@@ -54,13 +54,49 @@ def load_resource_mapping(config_dir: str) -> Dict[str, Any]:
     return mapping
 
 
-def list_training_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str]:
+def build_domain_arn(domain_id: str, region: str, account: str) -> str:
     """
-    List all training jobs tagged with the specified domain ID
+    Build domain ARN from domain ID
+    
+    Args:
+        domain_id: Domain ID
+        region: AWS region
+        account: AWS account ID
+        
+    Returns:
+        Domain ARN
+    """
+    return f"arn:aws:sagemaker:{region}:{account}:domain/{domain_id}"
+
+
+def extract_region_and_account_from_arn(arn: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract region and account from an ARN
+    
+    Args:
+        arn: ARN string
+        
+    Returns:
+        Tuple of (region, account) or (None, None) if extraction fails
+    """
+    try:
+        # ARN format: arn:aws:sagemaker:region:account:resource-type/resource-id
+        parts = arn.split(':')
+        if len(parts) >= 5:
+            return parts[3], parts[4].split('/')[0]  # Account may have resource path
+    except Exception:
+        pass
+    return None, None
+
+
+def list_training_jobs_by_domain(sagemaker_client, old_domain_id: str, old_domain_arn: str) -> List[str]:
+    """
+    List all training jobs tagged with the specified domain ARN or domain ID
     
     Args:
         sagemaker_client: Boto3 SageMaker client
-        domain_id: Domain ID to filter by
+        old_domain_id: Domain ID to filter by
+        old_domain_arn: Domain ARN to filter by
         
     Returns:
         List of training job ARNs
@@ -68,7 +104,7 @@ def list_training_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str]:
     training_job_arns = []
     next_token = None
     
-    logger.info(f"Listing training jobs for domain {domain_id}")
+    logger.info(f"Listing training jobs for domain {old_domain_id}")
     
     try:
         while True:
@@ -85,12 +121,14 @@ def list_training_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str]:
                 job_details = sagemaker_client.describe_training_job(TrainingJobName=job_name)
                 job_arn = job_details['TrainingJobArn']
                 
-                # Check if job has domain tag
+                # Check if job has domain ARN or domain ID tag
                 tags = sagemaker_client.list_tags(ResourceArn=job_arn).get('Tags', [])
                 for tag in tags:
-                    if tag.get('Key') == 'sagemaker:domain-id' and tag.get('Value') == domain_id:
-                        training_job_arns.append(job_arn)
-                        break
+                    if tag.get('Key') == 'sagemaker:domain-arn':
+                        tag_value = tag.get('Value')
+                        if tag_value == old_domain_arn or tag_value == old_domain_id:
+                            training_job_arns.append(job_arn)
+                            break
             
             next_token = response.get('NextToken')
             if not next_token:
@@ -104,13 +142,14 @@ def list_training_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str]:
         raise
 
 
-def list_processing_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str]:
+def list_processing_jobs_by_domain(sagemaker_client, old_domain_id: str, old_domain_arn: str) -> List[str]:
     """
-    List all processing jobs tagged with the specified domain ID
+    List all processing jobs tagged with the specified domain ARN or domain ID
     
     Args:
         sagemaker_client: Boto3 SageMaker client
-        domain_id: Domain ID to filter by
+        old_domain_id: Domain ID to filter by
+        old_domain_arn: Domain ARN to filter by
         
     Returns:
         List of processing job ARNs
@@ -118,7 +157,7 @@ def list_processing_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str
     processing_job_arns = []
     next_token = None
     
-    logger.info(f"Listing processing jobs for domain {domain_id}")
+    logger.info(f"Listing processing jobs for domain {old_domain_id}")
     
     try:
         while True:
@@ -135,12 +174,14 @@ def list_processing_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str
                 job_details = sagemaker_client.describe_processing_job(ProcessingJobName=job_name)
                 job_arn = job_details['ProcessingJobArn']
                 
-                # Check if job has domain tag
+                # Check if job has domain ARN or domain ID tag
                 tags = sagemaker_client.list_tags(ResourceArn=job_arn).get('Tags', [])
                 for tag in tags:
-                    if tag.get('Key') == 'sagemaker:domain-id' and tag.get('Value') == domain_id:
-                        processing_job_arns.append(job_arn)
-                        break
+                    if tag.get('Key') == 'sagemaker:domain-arn':
+                        tag_value = tag.get('Value')
+                        if tag_value == old_domain_arn or tag_value == old_domain_id:
+                            processing_job_arns.append(job_arn)
+                            break
             
             next_token = response.get('NextToken')
             if not next_token:
@@ -154,13 +195,14 @@ def list_processing_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str
         raise
 
 
-def list_transform_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str]:
+def list_transform_jobs_by_domain(sagemaker_client, old_domain_id: str, old_domain_arn: str) -> List[str]:
     """
-    List all transform jobs tagged with the specified domain ID
+    List all transform jobs tagged with the specified domain ARN or domain ID
     
     Args:
         sagemaker_client: Boto3 SageMaker client
-        domain_id: Domain ID to filter by
+        old_domain_id: Domain ID to filter by
+        old_domain_arn: Domain ARN to filter by
         
     Returns:
         List of transform job ARNs
@@ -168,7 +210,7 @@ def list_transform_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str]
     transform_job_arns = []
     next_token = None
     
-    logger.info(f"Listing transform jobs for domain {domain_id}")
+    logger.info(f"Listing transform jobs for domain {old_domain_id}")
     
     try:
         while True:
@@ -185,12 +227,14 @@ def list_transform_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str]
                 job_details = sagemaker_client.describe_transform_job(TransformJobName=job_name)
                 job_arn = job_details['TransformJobArn']
                 
-                # Check if job has domain tag
+                # Check if job has domain ARN or domain ID tag
                 tags = sagemaker_client.list_tags(ResourceArn=job_arn).get('Tags', [])
                 for tag in tags:
-                    if tag.get('Key') == 'sagemaker:domain-id' and tag.get('Value') == domain_id:
-                        transform_job_arns.append(job_arn)
-                        break
+                    if tag.get('Key') == 'sagemaker:domain-arn':
+                        tag_value = tag.get('Value')
+                        if tag_value == old_domain_arn or tag_value == old_domain_id:
+                            transform_job_arns.append(job_arn)
+                            break
             
             next_token = response.get('NextToken')
             if not next_token:
@@ -204,13 +248,14 @@ def list_transform_jobs_by_domain(sagemaker_client, domain_id: str) -> List[str]
         raise
 
 
-def list_pipelines_by_domain(sagemaker_client, domain_id: str) -> List[str]:
+def list_pipelines_by_domain(sagemaker_client, old_domain_id: str, old_domain_arn: str) -> List[str]:
     """
-    List all pipelines tagged with the specified domain ID
+    List all pipelines tagged with the specified domain ARN or domain ID
     
     Args:
         sagemaker_client: Boto3 SageMaker client
-        domain_id: Domain ID to filter by
+        old_domain_id: Domain ID to filter by
+        old_domain_arn: Domain ARN to filter by
         
     Returns:
         List of pipeline ARNs
@@ -218,7 +263,7 @@ def list_pipelines_by_domain(sagemaker_client, domain_id: str) -> List[str]:
     pipeline_arns = []
     next_token = None
     
-    logger.info(f"Listing pipelines for domain {domain_id}")
+    logger.info(f"Listing pipelines for domain {old_domain_id}")
     
     try:
         while True:
@@ -235,12 +280,14 @@ def list_pipelines_by_domain(sagemaker_client, domain_id: str) -> List[str]:
                 pipeline_details = sagemaker_client.describe_pipeline(PipelineName=pipeline_name)
                 pipeline_arn = pipeline_details['PipelineArn']
                 
-                # Check if pipeline has domain tag
+                # Check if pipeline has domain ARN or domain ID tag
                 tags = sagemaker_client.list_tags(ResourceArn=pipeline_arn).get('Tags', [])
                 for tag in tags:
-                    if tag.get('Key') == 'sagemaker:domain-id' and tag.get('Value') == domain_id:
-                        pipeline_arns.append(pipeline_arn)
-                        break
+                    if tag.get('Key') == 'sagemaker:domain-arn':
+                        tag_value = tag.get('Value')
+                        if tag_value == old_domain_arn or tag_value == old_domain_id:
+                            pipeline_arns.append(pipeline_arn)
+                            break
             
             next_token = response.get('NextToken')
             if not next_token:
@@ -254,13 +301,14 @@ def list_pipelines_by_domain(sagemaker_client, domain_id: str) -> List[str]:
         raise
 
 
-def list_endpoints_by_domain(sagemaker_client, domain_id: str) -> List[str]:
+def list_endpoints_by_domain(sagemaker_client, old_domain_id: str, old_domain_arn: str) -> List[str]:
     """
-    List all endpoints tagged with the specified domain ID
+    List all endpoints tagged with the specified domain ARN or domain ID
     
     Args:
         sagemaker_client: Boto3 SageMaker client
-        domain_id: Domain ID to filter by
+        old_domain_id: Domain ID to filter by
+        old_domain_arn: Domain ARN to filter by
         
     Returns:
         List of endpoint ARNs
@@ -268,7 +316,7 @@ def list_endpoints_by_domain(sagemaker_client, domain_id: str) -> List[str]:
     endpoint_arns = []
     next_token = None
     
-    logger.info(f"Listing endpoints for domain {domain_id}")
+    logger.info(f"Listing endpoints for domain {old_domain_id}")
     
     try:
         while True:
@@ -285,12 +333,14 @@ def list_endpoints_by_domain(sagemaker_client, domain_id: str) -> List[str]:
                 endpoint_details = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
                 endpoint_arn = endpoint_details['EndpointArn']
                 
-                # Check if endpoint has domain tag
+                # Check if endpoint has domain ARN or domain ID tag
                 tags = sagemaker_client.list_tags(ResourceArn=endpoint_arn).get('Tags', [])
                 for tag in tags:
-                    if tag.get('Key') == 'sagemaker:domain-id' and tag.get('Value') == domain_id:
-                        endpoint_arns.append(endpoint_arn)
-                        break
+                    if tag.get('Key') == 'sagemaker:domain-arn':
+                        tag_value = tag.get('Value')
+                        if tag_value == old_domain_arn or tag_value == old_domain_id:
+                            endpoint_arns.append(endpoint_arn)
+                            break
             
             next_token = response.get('NextToken')
             if not next_token:
@@ -304,25 +354,26 @@ def list_endpoints_by_domain(sagemaker_client, domain_id: str) -> List[str]:
         raise
 
 
-def list_tagged_resources(sagemaker_client, domain_id: str) -> Dict[str, List[str]]:
+def list_tagged_resources(sagemaker_client, old_domain_id: str, old_domain_arn: str) -> Dict[str, List[str]]:
     """
-    List all SageMaker resources tagged with the specified domain ID
+    List all SageMaker resources tagged with the specified domain ARN or domain ID
     
     Args:
         sagemaker_client: Boto3 SageMaker client
-        domain_id: Domain ID to filter by
+        old_domain_id: Domain ID to filter by
+        old_domain_arn: Domain ARN to filter by
         
     Returns:
         Dictionary with resource types as keys and lists of ARNs as values
     """
-    logger.info(f"Discovering all resources tagged with domain {domain_id}")
+    logger.info(f"Discovering all resources tagged with domain {old_domain_id}")
     
     resources = {
-        'training_jobs': list_training_jobs_by_domain(sagemaker_client, domain_id),
-        'processing_jobs': list_processing_jobs_by_domain(sagemaker_client, domain_id),
-        'transform_jobs': list_transform_jobs_by_domain(sagemaker_client, domain_id),
-        'pipelines': list_pipelines_by_domain(sagemaker_client, domain_id),
-        'endpoints': list_endpoints_by_domain(sagemaker_client, domain_id)
+        'training_jobs': list_training_jobs_by_domain(sagemaker_client, old_domain_id, old_domain_arn),
+        'processing_jobs': list_processing_jobs_by_domain(sagemaker_client, old_domain_id, old_domain_arn),
+        'transform_jobs': list_transform_jobs_by_domain(sagemaker_client, old_domain_id, old_domain_arn),
+        'pipelines': list_pipelines_by_domain(sagemaker_client, old_domain_id, old_domain_arn),
+        'endpoints': list_endpoints_by_domain(sagemaker_client, old_domain_id, old_domain_arn)
     }
     
     total_resources = sum(len(arns) for arns in resources.values())
@@ -361,15 +412,16 @@ def map_arn(old_arn: str, mapping: Dict[str, Any]) -> str:
     Returns:
         New ARN if found in mapping, otherwise original ARN
     """
-    # Check user profile mapping
+    # Check user profile mapping (direct ARN to ARN mapping)
     if old_arn in mapping.get('user_profiles', {}):
         return mapping['user_profiles'][old_arn]
     
-    # Check space mapping
+    # Check space mapping (direct ARN to ARN mapping)
     if old_arn in mapping.get('spaces', {}):
         return mapping['spaces'][old_arn]
     
-    # No mapping found, return original
+    # No mapping found, log warning and return original
+    logger.warning(f"Could not find mapping for ARN: {old_arn}")
     return old_arn
 
 
@@ -397,23 +449,35 @@ def update_resource_tags(
         # Get current tags
         current_tags = get_resource_tags(sagemaker_client, resource_arn)
         
+        # Extract region and account from resource ARN for building new ARNs
+        region, account = extract_region_and_account_from_arn(resource_arn)
+        
+        if not region or not account:
+            logger.warning(f"Could not extract region/account from ARN: {resource_arn}")
+            return True, None
+        
         # Build new tags list
         tags_to_delete = []
         tags_to_add = []
+        
+        # Build old and new domain ARNs
+        old_domain_arn = build_domain_arn(old_domain_id, region, account)
+        new_domain_arn = build_domain_arn(new_domain_id, region, account)
         
         for tag in current_tags:
             key = tag['Key']
             value = tag['Value']
             
             # Check if tag needs updating
-            if key == 'sagemaker:domain-id' and value == old_domain_id:
-                # Update domain ID tag
-                tags_to_delete.append(key)
-                tags_to_add.append({'Key': key, 'Value': new_domain_id})
-                logger.debug(f"Updating domain ID tag: {old_domain_id} -> {new_domain_id}")
+            if key == 'sagemaker:domain-arn':
+                # Handle both domain ID and domain ARN formats
+                if value == old_domain_id or value == old_domain_arn:
+                    tags_to_delete.append(key)
+                    tags_to_add.append({'Key': key, 'Value': new_domain_arn})
+                    logger.debug(f"Updating domain ARN tag: {value} -> {new_domain_arn}")
             
             elif key == 'sagemaker:user-profile-arn':
-                # Map user profile ARN
+                # Map user profile ARN using direct mapping
                 new_arn = map_arn(value, mapping)
                 if new_arn != value:
                     tags_to_delete.append(key)
@@ -421,7 +485,7 @@ def update_resource_tags(
                     logger.debug(f"Updating user profile ARN: {value} -> {new_arn}")
             
             elif key == 'sagemaker:space-arn':
-                # Map space ARN
+                # Map space ARN using direct mapping
                 new_arn = map_arn(value, mapping)
                 if new_arn != value:
                     tags_to_delete.append(key)
@@ -539,9 +603,35 @@ def retag_resources(config_dir: str, old_domain_id: str, new_domain_id: str) -> 
         logger.warning(f"New domain ID mismatch: provided {new_domain_id}, "
                       f"mapping has {mapping['domain']['new']}")
     
+    # Build old domain ARN for filtering
+    # Extract region and account from a resource in the mapping
+    region = None
+    account = None
+    
+    # Try to get region/account from user profile ARNs in mapping
+    for old_arn in mapping.get('user_profiles', {}).keys():
+        region, account = extract_region_and_account_from_arn(old_arn)
+        if region and account:
+            break
+    
+    # If not found in user profiles, try spaces
+    if not region or not account:
+        for old_arn in mapping.get('spaces', {}).keys():
+            region, account = extract_region_and_account_from_arn(old_arn)
+            if region and account:
+                break
+    
+    # Build old domain ARN
+    old_domain_arn = build_domain_arn(old_domain_id, region, account) if region and account else old_domain_id
+    
+    if not region or not account:
+        logger.warning("Could not extract region/account from mapping. Will only match domain ID format tags.")
+    else:
+        logger.info(f"Built old domain ARN: {old_domain_arn}")
+    
     # Discover tagged resources
     logger.info("Step 2: Discovering tagged resources...")
-    resources = list_tagged_resources(sagemaker_client, old_domain_id)
+    resources = list_tagged_resources(sagemaker_client, old_domain_id, old_domain_arn)
     
     total_resources = sum(len(arns) for arns in resources.values())
     if total_resources == 0:
