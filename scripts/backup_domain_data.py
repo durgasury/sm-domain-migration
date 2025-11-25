@@ -42,9 +42,12 @@ def generate_backup_lifecycle_script(s3_bucket: str, s3_prefix: str) -> str:
     script = f"""#!/bin/bash
 set -e
 
-# Get user profile and space information from environment
-USER_PROFILE_NAME=${{SAGEMAKER_USER_PROFILE_NAME:-"unknown"}}
-SPACE_NAME=${{SAGEMAKER_SPACE_NAME:-"unknown"}}
+# Get space name and domain ID from metadata file
+export SM_BCK_SPACE_NAME=$(cat /opt/ml/metadata/resource-metadata.json | jq -r '.SpaceName')
+export SM_BCK_DOMAIN_ID=$(cat /opt/ml/metadata/resource-metadata.json | jq -r '.DomainId')
+
+# Get user profile name from space ownership
+export SM_BCK_USER_PROFILE_NAME=$(aws sagemaker describe-space --domain-id=$SM_BCK_DOMAIN_ID --space-name=$SM_BCK_SPACE_NAME | jq -r '.OwnershipSettings.OwnerUserProfileName')
 
 # Construct S3 path
 S3_BUCKET="{s3_bucket}"
@@ -52,12 +55,15 @@ S3_PREFIX="{s3_prefix}"
 
 # Build full S3 path with user profile and space
 if [ -n "$S3_PREFIX" ] && [ "$S3_PREFIX" != "" ]; then
-    S3_PATH="s3://${{S3_BUCKET}}/${{S3_PREFIX}}/${{USER_PROFILE_NAME}}/${{SPACE_NAME}}"
+    S3_PATH="s3://${{S3_BUCKET}}/${{S3_PREFIX}}/${{SM_BCK_USER_PROFILE_NAME}}/${{SM_BCK_SPACE_NAME}}"
 else
-    S3_PATH="s3://${{S3_BUCKET}}/${{USER_PROFILE_NAME}}/${{SPACE_NAME}}"
+    S3_PATH="s3://${{S3_BUCKET}}/${{SM_BCK_USER_PROFILE_NAME}}/${{SM_BCK_SPACE_NAME}}"
 fi
 
 echo "Starting backup to $S3_PATH"
+echo "Domain ID: $SM_BCK_DOMAIN_ID"
+echo "Space Name: $SM_BCK_SPACE_NAME"
+echo "User Profile: $SM_BCK_USER_PROFILE_NAME"
 
 # Sync user data to S3, excluding cache directories
 aws s3 sync /home/sagemaker-user "$S3_PATH" --exclude ".cache/*" --exclude "lost+found/*"
@@ -330,7 +336,9 @@ def wait_for_app_ready(
 
 def restart_app(
     sagemaker_client,
-    app_info: Dict[str, Any]
+    app_info: Dict[str, Any],
+    jupyterlab_lcc_arn: str,
+    codeeditor_lcc_arn: str
 ) -> Tuple[bool, Optional[str]]:
     """
     Restart an app by deleting and recreating it
@@ -338,6 +346,8 @@ def restart_app(
     Args:
         sagemaker_client: Boto3 SageMaker client
         app_info: App information dictionary
+        jupyterlab_lcc_arn: JupyterLab lifecycle config ARN
+        codeeditor_lcc_arn: CodeEditor lifecycle config ARN
         
     Returns:
         Tuple of (success: bool, error_message: Optional[str])
@@ -356,6 +366,22 @@ def restart_app(
             identifier = f"{user_profile_name}/{app_type}/{app_name}"
         
         logger.info(f"Restarting app: {identifier}")
+        
+        # Get app details before deletion to capture ResourceSpec
+        describe_kwargs = {
+            'DomainId': domain_id,
+            'AppType': app_type,
+            'AppName': app_name
+        }
+        
+        if user_profile_name:
+            describe_kwargs['UserProfileName'] = user_profile_name
+        if space_name:
+            describe_kwargs['SpaceName'] = space_name
+        
+        app_details = sagemaker_client.describe_app(**describe_kwargs)
+        resource_spec = app_details.get('ResourceSpec', {})
+        logger.info(f"Captured ResourceSpec for app: {identifier}")
         
         # Delete the app
         delete_kwargs = {
@@ -382,7 +408,7 @@ def restart_app(
         
         logger.info(f"App deleted successfully: {identifier}")
         
-        # Recreate the app
+        # Recreate the app with the same ResourceSpec
         create_kwargs = {
             'DomainId': domain_id,
             'AppType': app_type,
@@ -393,6 +419,15 @@ def restart_app(
             create_kwargs['UserProfileName'] = user_profile_name
         if space_name:
             create_kwargs['SpaceName'] = space_name
+        
+        # Add ResourceSpec if it was present in the original app
+        if resource_spec:
+            # Append the appropriate lifecycle config ARN based on app type
+            lcc_arn = jupyterlab_lcc_arn if app_type == 'JupyterLab' else codeeditor_lcc_arn
+            resource_spec['LifecycleConfigArn'] = lcc_arn
+            
+            create_kwargs['ResourceSpec'] = resource_spec
+            logger.info(f"Using ResourceSpec with LCC: {resource_spec}")
         
         sagemaker_client.create_app(**create_kwargs)
         logger.info(f"Initiated creation of app: {identifier}")
@@ -473,7 +508,12 @@ def backup_domain_data(
         successful_count = 0
         
         for app_info in active_apps:
-            success, error = restart_app(sagemaker_client, app_info)
+            success, error = restart_app(
+                sagemaker_client, 
+                app_info, 
+                jupyterlab_lcc_arn, 
+                codeeditor_lcc_arn
+            )
             
             if success:
                 successful_count += 1

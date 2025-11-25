@@ -50,7 +50,7 @@ When an AWS account moves between AWS Organizations, SSO-based SageMaker Studio 
 1. Clone or download this repository:
 ```bash
 git clone <repository-url>
-cd sagemaker-domain-migration
+cd sm-domain-migration
 ```
 
 2. Install required Python packages:
@@ -136,6 +136,45 @@ python scripts/backup_domain_data.py \
 ```
 
 **⚠️ Important:** This phase will restart all active apps. Users will be temporarily disconnected.
+
+### Optional: Delete Apps (Cost Savings)
+
+After backing up data, you can optionally delete all JupyterLab and CodeEditor apps to save costs while the domain is not actively being used.
+
+**Command:**
+```bash
+python scripts/delete_domain_apps.py \
+  --domain-id d-xxxxxxxxxxxx \
+  [--dry-run] \
+  [--config-dir ./migration_data]
+```
+
+**Parameters:**
+- `--domain-id` (required): The ID of the domain
+- `--dry-run` (optional): Show what would be deleted without actually deleting
+- `--config-dir` (optional): Directory for output files (default: `./migration_data`)
+
+**Output Files:**
+- `migration_data/deletion_status.json`: Deletion operation status
+
+**What This Does:**
+1. Lists all JupyterLab and CodeEditor apps in the domain
+2. Deletes all apps (except those already in Deleted status)
+3. Saves a status report of successful and failed deletions
+
+**Example:**
+```bash
+# First, do a dry run to see what would be deleted
+python scripts/delete_domain_apps.py --domain-id d-abc123def456 --dry-run
+
+# Then actually delete the apps
+python scripts/delete_domain_apps.py --domain-id d-abc123def456
+```
+
+**⚠️ Important:** 
+- Apps will need to be manually restarted by users when they next access the domain
+- This is useful for cost savings during the account migration period
+- Always run with `--dry-run` first to verify what will be deleted
 
 ### Phase 3: Account Migration
 
@@ -348,6 +387,42 @@ python scripts/restore_domain_data.py \
 - `sagemaker:DescribeApp`
 - `s3:GetObject`
 - `s3:ListBucket`
+
+### delete_domain_apps.py
+
+Deletes all JupyterLab and CodeEditor apps in a domain for cost savings.
+
+**Usage:**
+```bash
+python scripts/delete_domain_apps.py \
+  --domain-id <domain-id> \
+  [--dry-run] \
+  [--config-dir <path>]
+```
+
+**Parameters:**
+- `--domain-id` (required): The ID of the domain
+- `--dry-run` (optional): Show what would be deleted without actually deleting
+- `--config-dir` (optional): Directory for output files (default: `./migration_data`)
+- `--log-level` (optional): Logging level (default: INFO)
+
+**Required IAM Permissions:**
+- `sagemaker:ListApps`
+- `sagemaker:DeleteApp`
+
+**Use Cases:**
+- Cost savings during account migration when apps are not actively being used
+- Cleaning up apps before domain deletion
+- Forcing all users to restart apps with new configurations
+
+**Example:**
+```bash
+# Preview what would be deleted
+python scripts/delete_domain_apps.py --domain-id d-abc123def456 --dry-run
+
+# Actually delete all apps
+python scripts/delete_domain_apps.py --domain-id d-abc123def456
+```
 
 ## IAM Permissions
 
