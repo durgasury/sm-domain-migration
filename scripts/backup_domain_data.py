@@ -334,23 +334,19 @@ def wait_for_app_ready(
     return False
 
 
-def restart_app(
+def delete_app(
     sagemaker_client,
-    app_info: Dict[str, Any],
-    jupyterlab_lcc_arn: str,
-    codeeditor_lcc_arn: str
-) -> Tuple[bool, Optional[str]]:
+    app_info: Dict[str, Any]
+) -> Tuple[bool, Optional[str], Dict[str, Any]]:
     """
-    Restart an app by deleting and recreating it
+    Delete an app and capture its ResourceSpec
     
     Args:
         sagemaker_client: Boto3 SageMaker client
         app_info: App information dictionary
-        jupyterlab_lcc_arn: JupyterLab lifecycle config ARN
-        codeeditor_lcc_arn: CodeEditor lifecycle config ARN
         
     Returns:
-        Tuple of (success: bool, error_message: Optional[str])
+        Tuple of (success: bool, error_message: Optional[str], resource_spec: Dict)
     """
     domain_id = app_info['DomainId']
     user_profile_name = app_info.get('UserProfileName')
@@ -365,7 +361,7 @@ def restart_app(
         else:
             identifier = f"{user_profile_name}/{app_type}/{app_name}"
         
-        logger.info(f"Restarting app: {identifier}")
+        logger.info(f"Deleting app: {identifier}")
         
         # Get app details before deletion to capture ResourceSpec
         describe_kwargs = {
@@ -398,15 +394,48 @@ def restart_app(
         sagemaker_client.delete_app(**delete_kwargs)
         logger.info(f"Initiated deletion of app: {identifier}")
         
-        # Wait for deletion to complete
-        if not wait_for_app_deleted(
-            sagemaker_client, domain_id, user_profile_name, space_name, app_type, app_name
-        ):
-            error_msg = f"Timeout waiting for app deletion: {identifier}"
-            logger.error(error_msg)
-            return False, error_msg
+        return True, None, resource_spec
         
-        logger.info(f"App deleted successfully: {identifier}")
+    except Exception as e:
+        error_msg = f"Failed to delete app: {str(e)}"
+        logger.error(error_msg)
+        return False, error_msg, {}
+
+
+def create_app(
+    sagemaker_client,
+    app_info: Dict[str, Any],
+    resource_spec: Dict[str, Any],
+    jupyterlab_lcc_arn: str,
+    codeeditor_lcc_arn: str
+) -> Tuple[bool, Optional[str]]:
+    """
+    Create an app with the specified ResourceSpec
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        app_info: App information dictionary
+        resource_spec: ResourceSpec to use for the app
+        jupyterlab_lcc_arn: JupyterLab lifecycle config ARN
+        codeeditor_lcc_arn: CodeEditor lifecycle config ARN
+        
+    Returns:
+        Tuple of (success: bool, error_message: Optional[str])
+    """
+    domain_id = app_info['DomainId']
+    user_profile_name = app_info.get('UserProfileName')
+    space_name = app_info.get('SpaceName')
+    app_type = app_info['AppType']
+    app_name = app_info['AppName']
+    
+    try:
+        # Build identifier for logging
+        if space_name:
+            identifier = f"{space_name}/{app_type}/{app_name}"
+        else:
+            identifier = f"{user_profile_name}/{app_type}/{app_name}"
+        
+        logger.info(f"Creating app: {identifier}")
         
         # Recreate the app with the same ResourceSpec
         create_kwargs = {
@@ -432,21 +461,184 @@ def restart_app(
         sagemaker_client.create_app(**create_kwargs)
         logger.info(f"Initiated creation of app: {identifier}")
         
-        # Wait for app to be ready
-        if not wait_for_app_ready(
-            sagemaker_client, domain_id, user_profile_name, space_name, app_type, app_name
-        ):
-            error_msg = f"App failed to start or timed out: {identifier}"
-            logger.error(error_msg)
-            return False, error_msg
-        
-        logger.info(f"App restarted successfully: {identifier}")
         return True, None
         
     except Exception as e:
-        error_msg = f"Failed to restart app: {str(e)}"
+        error_msg = f"Failed to create app: {str(e)}"
         logger.error(error_msg)
         return False, error_msg
+
+
+def restart_apps_parallel(
+    sagemaker_client,
+    active_apps: List[Dict[str, Any]],
+    jupyterlab_lcc_arn: str,
+    codeeditor_lcc_arn: str
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    Restart all apps in parallel by deleting all, then creating all
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        active_apps: List of app information dictionaries
+        jupyterlab_lcc_arn: JupyterLab lifecycle config ARN
+        codeeditor_lcc_arn: CodeEditor lifecycle config ARN
+        
+    Returns:
+        Tuple of (successful_count, failed_apps)
+    """
+    failed_apps = []
+    app_resource_specs = {}
+    
+    # Phase 1: Delete all apps and capture ResourceSpecs
+    logger.info(f"Phase 1: Deleting {len(active_apps)} apps...")
+    for app_info in active_apps:
+        success, error, resource_spec = delete_app(sagemaker_client, app_info)
+        
+        if success:
+            # Store ResourceSpec for later recreation
+            app_key = (
+                app_info.get('UserProfileName'),
+                app_info.get('SpaceName'),
+                app_info['AppType'],
+                app_info['AppName']
+            )
+            app_resource_specs[app_key] = resource_spec
+        else:
+            failed_apps.append({
+                'user_profile_name': app_info.get('UserProfileName'),
+                'space_name': app_info.get('SpaceName'),
+                'app_type': app_info['AppType'],
+                'app_name': app_info['AppName'],
+                'error': error,
+                'phase': 'deletion'
+            })
+    
+    # Wait for all deletions to complete
+    logger.info("Waiting for all app deletions to complete...")
+    for app_info in active_apps:
+        # Skip apps that failed to delete
+        app_key = (
+            app_info.get('UserProfileName'),
+            app_info.get('SpaceName'),
+            app_info['AppType'],
+            app_info['AppName']
+        )
+        if app_key not in app_resource_specs:
+            continue
+        
+        if not wait_for_app_deleted(
+            sagemaker_client,
+            app_info['DomainId'],
+            app_info.get('UserProfileName'),
+            app_info.get('SpaceName'),
+            app_info['AppType'],
+            app_info['AppName']
+        ):
+            failed_apps.append({
+                'user_profile_name': app_info.get('UserProfileName'),
+                'space_name': app_info.get('SpaceName'),
+                'app_type': app_info['AppType'],
+                'app_name': app_info['AppName'],
+                'error': 'Timeout waiting for app deletion',
+                'phase': 'deletion_wait'
+            })
+            # Remove from resource specs so we don't try to recreate
+            del app_resource_specs[app_key]
+    
+    logger.info(f"Phase 1 complete. {len(app_resource_specs)} apps ready for recreation")
+    
+    # Phase 2: Create all apps with 2-3 second delay between calls
+    logger.info(f"Phase 2: Creating {len(app_resource_specs)} apps...")
+    for i, (app_key, resource_spec) in enumerate(app_resource_specs.items()):
+        user_profile_name, space_name, app_type, app_name = app_key
+        
+        # Find the original app_info
+        app_info = next(
+            (app for app in active_apps
+             if app.get('UserProfileName') == user_profile_name
+             and app.get('SpaceName') == space_name
+             and app['AppType'] == app_type
+             and app['AppName'] == app_name),
+            None
+        )
+        
+        if not app_info:
+            continue
+        
+        success, error = create_app(
+            sagemaker_client,
+            app_info,
+            resource_spec,
+            jupyterlab_lcc_arn,
+            codeeditor_lcc_arn
+        )
+        
+        if not success:
+            failed_apps.append({
+                'user_profile_name': user_profile_name,
+                'space_name': space_name,
+                'app_type': app_type,
+                'app_name': app_name,
+                'error': error,
+                'phase': 'creation'
+            })
+        
+        # Add delay between API calls to avoid throttling (except for last app)
+        if i < len(app_resource_specs) - 1:
+            time.sleep(2)
+    
+    # Phase 3: Wait for all apps to be ready
+    logger.info("Phase 3: Waiting for all apps to be ready...")
+    successful_count = 0
+    
+    for app_key in app_resource_specs.keys():
+        user_profile_name, space_name, app_type, app_name = app_key
+        
+        # Skip apps that failed to create
+        if any(f['user_profile_name'] == user_profile_name
+               and f['space_name'] == space_name
+               and f['app_type'] == app_type
+               and f['app_name'] == app_name
+               and f['phase'] == 'creation'
+               for f in failed_apps):
+            continue
+        
+        # Find the original app_info
+        app_info = next(
+            (app for app in active_apps
+             if app.get('UserProfileName') == user_profile_name
+             and app.get('SpaceName') == space_name
+             and app['AppType'] == app_type
+             and app['AppName'] == app_name),
+            None
+        )
+        
+        if not app_info:
+            continue
+        
+        if wait_for_app_ready(
+            sagemaker_client,
+            app_info['DomainId'],
+            user_profile_name,
+            space_name,
+            app_type,
+            app_name
+        ):
+            successful_count += 1
+        else:
+            failed_apps.append({
+                'user_profile_name': user_profile_name,
+                'space_name': space_name,
+                'app_type': app_type,
+                'app_name': app_name,
+                'error': 'App failed to start or timed out',
+                'phase': 'ready_wait'
+            })
+    
+    logger.info(f"Phase 3 complete. {successful_count} apps ready")
+    
+    return successful_count, failed_apps
 
 
 def backup_domain_data(
@@ -501,30 +693,15 @@ def backup_domain_data(
         logger.info("Backup lifecycle configurations have been attached to the domain")
         logger.info("Apps will sync data to S3 when they are next started")
     else:
-        # Restart all active apps
-        logger.info(f"Restarting {len(active_apps)} active apps...")
+        # Restart all active apps in parallel
+        logger.info(f"Restarting {len(active_apps)} active apps in parallel...")
         
-        failed_apps = []
-        successful_count = 0
-        
-        for app_info in active_apps:
-            success, error = restart_app(
-                sagemaker_client, 
-                app_info, 
-                jupyterlab_lcc_arn, 
-                codeeditor_lcc_arn
-            )
-            
-            if success:
-                successful_count += 1
-            else:
-                failed_apps.append({
-                    'user_profile_name': app_info.get('UserProfileName'),
-                    'space_name': app_info.get('SpaceName'),
-                    'app_type': app_info['AppType'],
-                    'app_name': app_info['AppName'],
-                    'error': error
-                })
+        successful_count, failed_apps = restart_apps_parallel(
+            sagemaker_client,
+            active_apps,
+            jupyterlab_lcc_arn,
+            codeeditor_lcc_arn
+        )
         
         # Save backup status
         backup_status = {

@@ -363,6 +363,88 @@ def start_space_app(
         return False, error_msg
 
 
+def create_space_app(
+    sagemaker_client,
+    domain_id: str,
+    space_name: str,
+    lcc_arn: str,
+    resource_spec: Optional[Dict[str, Any]] = None,
+    app_type: str = 'JupyterLab'
+) -> Tuple[bool, Optional[str]]:
+    """
+    Create an app for a space (without waiting)
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        domain_id: SageMaker domain ID
+        space_name: Space name
+        lcc_arn: Lifecycle configuration ARN to attach
+        resource_spec: ResourceSpec from original domain (optional)
+        app_type: App type (default: JupyterLab)
+        
+    Returns:
+        Tuple of (success: bool, error_message: Optional[str])
+    """
+    try:
+        app_name = 'default'
+        identifier = f"{space_name}/{app_type}/{app_name}"
+        
+        logger.info(f"Creating app for space: {identifier}")
+        
+        # Check if app already exists
+        try:
+            existing_app = sagemaker_client.describe_app(
+                DomainId=domain_id,
+                SpaceName=space_name,
+                AppType=app_type,
+                AppName=app_name
+            )
+            
+            if existing_app['Status'] in ['InService', 'Pending']:
+                logger.info(f"App already exists for space {space_name}, skipping creation")
+                return True, None
+        except sagemaker_client.exceptions.ResourceNotFound:
+            # App doesn't exist, proceed with creation
+            pass
+        
+        # Use provided ResourceSpec or create a minimal one
+        if resource_spec:
+            final_resource_spec = resource_spec.copy()
+            logger.info(f"Using ResourceSpec from original domain: {final_resource_spec}")
+        else:
+            # Fallback to minimal ResourceSpec
+            final_resource_spec = {
+                'InstanceType': 'ml.t3.medium'
+            }
+            logger.warning(f"No ResourceSpec found, using fallback: ml.t3.medium")
+        
+        # Add lifecycle config ARN to ResourceSpec
+        final_resource_spec['LifecycleConfigArn'] = lcc_arn
+        
+        # Create the app with ResourceSpec
+        create_kwargs = {
+            'DomainId': domain_id,
+            'SpaceName': space_name,
+            'AppType': app_type,
+            'AppName': app_name,
+            'ResourceSpec': final_resource_spec
+        }
+        
+        sagemaker_client.create_app(**create_kwargs)
+        logger.info(f"Initiated creation of app: {identifier} with LCC: {lcc_arn}")
+        
+        return True, None
+        
+    except sagemaker_client.exceptions.ResourceInUse:
+        # App already exists, which is fine
+        logger.info(f"App already exists for space {space_name}, skipping creation")
+        return True, None
+    except Exception as e:
+        error_msg = f"Failed to create app for space {space_name}: {str(e)}"
+        logger.error(error_msg)
+        return False, error_msg
+
+
 def start_all_spaces(
     sagemaker_client,
     domain_id: str,
@@ -372,7 +454,7 @@ def start_all_spaces(
     codeeditor_lcc_arn: str
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """
-    Start apps for all spaces to trigger restoration
+    Start apps for all spaces to trigger restoration (in parallel)
     
     Args:
         sagemaker_client: Boto3 SageMaker client
@@ -399,13 +481,15 @@ def start_all_spaces(
             key = (app['SpaceName'], app['AppType'])
             app_resource_specs[key] = app.get('ResourceSpec', {})
     
-    logger.info(f"Starting apps for {len(spaces)} spaces...")
+    logger.info(f"Starting apps for {len(spaces)} spaces in parallel...")
     logger.info(f"Found ResourceSpecs for {len(app_resource_specs)} apps from original domain")
     
-    successful_count = 0
     failed_spaces = []
+    created_apps = []
     
-    for space in spaces:
+    # Phase 1: Create all apps with delay between calls
+    logger.info(f"Phase 1: Creating apps for {len(spaces)} spaces...")
+    for i, space in enumerate(spaces):
         space_name = space['SpaceName']
         
         # Get owner user profile name from OwnershipSettings
@@ -417,26 +501,66 @@ def start_all_spaces(
         # Get ResourceSpec for this space's JupyterLab app if available
         resource_spec = app_resource_specs.get((space_name, 'JupyterLab'))
         
-        # Try JupyterLab first
-        success, error = start_space_app(
+        # Create JupyterLab app
+        success, error = create_space_app(
             sagemaker_client,
             domain_id,
             space_name,
-            owner_user_profile,
             jupyterlab_lcc_arn,
-            default_resource_spec=resource_spec,
+            resource_spec=resource_spec,
             app_type='JupyterLab'
         )
         
         if success:
-            successful_count += 1
+            created_apps.append({
+                'space_name': space_name,
+                'owner_user_profile': owner_user_profile,
+                'app_type': 'JupyterLab'
+            })
         else:
             failed_spaces.append({
                 'space_name': space_name,
                 'owner_user_profile': owner_user_profile,
                 'app_type': 'JupyterLab',
-                'error': error
+                'error': error,
+                'phase': 'creation'
             })
+        
+        # Add delay between API calls to avoid throttling (except for last app)
+        if i < len(spaces) - 1:
+            time.sleep(2)
+    
+    logger.info(f"Phase 1 complete. {len(created_apps)} apps created")
+    
+    # Phase 2: Wait for all apps to be ready
+    logger.info(f"Phase 2: Waiting for {len(created_apps)} apps to be ready...")
+    successful_count = 0
+    
+    for app_info in created_apps:
+        space_name = app_info['space_name']
+        app_type = app_info['app_type']
+        app_name = 'default'
+        
+        if wait_for_app_ready(
+            sagemaker_client,
+            domain_id,
+            None,
+            space_name,
+            app_type,
+            app_name
+        ):
+            successful_count += 1
+            logger.info(f"App ready: {space_name}/{app_type}/{app_name}")
+        else:
+            failed_spaces.append({
+                'space_name': space_name,
+                'owner_user_profile': app_info['owner_user_profile'],
+                'app_type': app_type,
+                'error': 'App failed to start or timed out',
+                'phase': 'ready_wait'
+            })
+    
+    logger.info(f"Phase 2 complete. {successful_count} apps ready")
     
     return successful_count, failed_spaces
 
