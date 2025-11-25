@@ -231,6 +231,106 @@ def get_space_details(sagemaker_client, domain_id: str, space_name: str) -> Dict
         raise
 
 
+def list_apps(sagemaker_client, domain_id: str) -> List[Dict[str, Any]]:
+    """
+    List all apps in a domain
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        domain_id: SageMaker domain ID
+        
+    Returns:
+        List of app information dictionaries
+    """
+    try:
+        logger.info(f"Listing apps for domain {domain_id}")
+        apps = []
+        next_token = None
+        
+        while True:
+            if next_token:
+                response = sagemaker_client.list_apps(
+                    DomainIdEquals=domain_id,
+                    NextToken=next_token
+                )
+            else:
+                response = sagemaker_client.list_apps(
+                    DomainIdEquals=domain_id
+                )
+            
+            for app in response.get('Apps', []):
+                # Only capture JupyterLab and CodeEditor apps that are InService
+                if app['AppType'] in ['JupyterLab', 'CodeEditor'] and app['Status'] == 'InService':
+                    apps.append({
+                        'DomainId': app['DomainId'],
+                        'UserProfileName': app.get('UserProfileName'),
+                        'SpaceName': app.get('SpaceName'),
+                        'AppType': app['AppType'],
+                        'AppName': app['AppName']
+                    })
+            
+            next_token = response.get('NextToken')
+            if not next_token:
+                break
+        
+        logger.info(f"Found {len(apps)} InService JupyterLab/CodeEditor apps")
+        return apps
+        
+    except Exception as e:
+        logger.error(f"Failed to list apps: {str(e)}")
+        raise
+
+
+def get_app_details(sagemaker_client, app_info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Get detailed configuration for an app, including ResourceSpec
+    
+    Args:
+        sagemaker_client: Boto3 SageMaker client
+        app_info: App information dictionary
+        
+    Returns:
+        App configuration dictionary with ResourceSpec
+    """
+    try:
+        domain_id = app_info['DomainId']
+        user_profile_name = app_info.get('UserProfileName')
+        space_name = app_info.get('SpaceName')
+        app_type = app_info['AppType']
+        app_name = app_info['AppName']
+        
+        logger.debug(f"Retrieving details for app: {space_name or user_profile_name}/{app_type}/{app_name}")
+        
+        describe_kwargs = {
+            'DomainId': domain_id,
+            'AppType': app_type,
+            'AppName': app_name
+        }
+        
+        if user_profile_name:
+            describe_kwargs['UserProfileName'] = user_profile_name
+        if space_name:
+            describe_kwargs['SpaceName'] = space_name
+        
+        response = sagemaker_client.describe_app(**describe_kwargs)
+        
+        # Extract relevant fields
+        app_config = {
+            'DomainId': domain_id,
+            'UserProfileName': user_profile_name,
+            'SpaceName': space_name,
+            'AppType': app_type,
+            'AppName': app_name,
+            'ResourceSpec': response.get('ResourceSpec', {})
+        }
+        
+        return app_config
+        
+    except Exception as e:
+        logger.error(f"Failed to retrieve app details: {str(e)}")
+        raise
+
+
 def discover_domain(domain_id: str, output_dir: str) -> None:
     """
     Main discovery function to capture all domain configuration
@@ -300,6 +400,18 @@ def discover_domain(domain_id: str, output_dir: str) -> None:
     except ValueError as e:
         logger.warning(f"Spaces configuration validation warning: {str(e)}")
     
+    # Get apps and their ResourceSpecs
+    app_list = list_apps(sagemaker_client, domain_id)
+    apps = []
+    
+    for app_info in app_list:
+        app_details = get_app_details(sagemaker_client, app_info)
+        apps.append(app_details)
+    
+    apps_data = {"Apps": apps}
+    apps_file = output_path / "apps.json"
+    save_json(apps_data, str(apps_file))
+    
     # Summary
     logger.info("=" * 60)
     logger.info("Discovery completed successfully")
@@ -308,6 +420,7 @@ def discover_domain(domain_id: str, output_dir: str) -> None:
     logger.info(f"Domain Name: {domain_config.get('DomainName')}")
     logger.info(f"User Profiles: {len(user_profiles)}")
     logger.info(f"Spaces: {len(spaces)}")
+    logger.info(f"Apps: {len(apps)}")
     logger.info(f"Configuration saved to: {output_dir}")
     logger.info("=" * 60)
 

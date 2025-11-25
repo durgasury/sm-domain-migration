@@ -43,9 +43,12 @@ def generate_restore_lifecycle_script(s3_bucket: str, s3_prefix: str) -> str:
     script = f"""#!/bin/bash
 set -e
 
-# Get user profile and space information from environment
-USER_PROFILE_NAME=${{SAGEMAKER_USER_PROFILE_NAME:-"unknown"}}
-SPACE_NAME=${{SAGEMAKER_SPACE_NAME:-"unknown"}}
+# Get space name and domain ID from metadata file
+export SM_RST_SPACE_NAME=$(cat /opt/ml/metadata/resource-metadata.json | jq -r '.SpaceName')
+export SM_RST_DOMAIN_ID=$(cat /opt/ml/metadata/resource-metadata.json | jq -r '.DomainId')
+
+# Get user profile name from space ownership
+export SM_RST_USER_PROFILE_NAME=$(aws sagemaker describe-space --domain-id=$SM_RST_DOMAIN_ID --space-name=$SM_RST_SPACE_NAME | jq -r '.OwnershipSettings.OwnerUserProfileName')
 
 # Construct S3 path
 S3_BUCKET="{s3_bucket}"
@@ -53,12 +56,15 @@ S3_PREFIX="{s3_prefix}"
 
 # Build full S3 path with user profile and space
 if [ -n "$S3_PREFIX" ] && [ "$S3_PREFIX" != "" ]; then
-    S3_PATH="s3://${{S3_BUCKET}}/${{S3_PREFIX}}/${{USER_PROFILE_NAME}}/${{SPACE_NAME}}"
+    S3_PATH="s3://${{S3_BUCKET}}/${{S3_PREFIX}}/${{SM_RST_USER_PROFILE_NAME}}/${{SM_RST_SPACE_NAME}}"
 else
-    S3_PATH="s3://${{S3_BUCKET}}/${{USER_PROFILE_NAME}}/${{SPACE_NAME}}"
+    S3_PATH="s3://${{S3_BUCKET}}/${{SM_RST_USER_PROFILE_NAME}}/${{SM_RST_SPACE_NAME}}"
 fi
 
 echo "Starting restoration from $S3_PATH"
+echo "Domain ID: $SM_RST_DOMAIN_ID"
+echo "Space Name: $SM_RST_SPACE_NAME"
+echo "User Profile: $SM_RST_USER_PROFILE_NAME"
 
 # Check if S3 path exists
 if aws s3 ls "$S3_PATH" > /dev/null 2>&1; then
@@ -269,6 +275,8 @@ def start_space_app(
     domain_id: str,
     space_name: str,
     owner_user_profile: str,
+    lcc_arn: str,
+    default_resource_spec: Optional[Dict[str, Any]] = None,
     app_type: str = 'JupyterLab'
 ) -> Tuple[bool, Optional[str]]:
     """
@@ -279,6 +287,8 @@ def start_space_app(
         domain_id: SageMaker domain ID
         space_name: Space name
         owner_user_profile: Owner user profile name
+        lcc_arn: Lifecycle configuration ARN to attach
+        default_resource_spec: Default ResourceSpec from original domain (optional)
         app_type: App type (default: JupyterLab)
         
     Returns:
@@ -290,15 +300,47 @@ def start_space_app(
         
         logger.info(f"Starting app for space: {identifier}")
         
-        # Create the app
-        sagemaker_client.create_app(
-            DomainId=domain_id,
-            SpaceName=space_name,
-            AppType=app_type,
-            AppName=app_name
-        )
+        # Check if app already exists
+        try:
+            existing_app = sagemaker_client.describe_app(
+                DomainId=domain_id,
+                SpaceName=space_name,
+                AppType=app_type,
+                AppName=app_name
+            )
+            
+            if existing_app['Status'] in ['InService', 'Pending']:
+                logger.info(f"App already exists for space {space_name}, skipping creation")
+                return True, None
+            
+            # Get existing ResourceSpec if available
+            resource_spec = existing_app.get('ResourceSpec', {})
+        except sagemaker_client.exceptions.ResourceNotFound:
+            # App doesn't exist, use provided default ResourceSpec or create a minimal one
+            if default_resource_spec:
+                resource_spec = default_resource_spec.copy()
+                logger.info(f"Using ResourceSpec from original domain: {resource_spec}")
+            else:
+                # Fallback to minimal ResourceSpec
+                resource_spec = {
+                    'InstanceType': 'ml.t3.medium'
+                }
+                logger.warning(f"No ResourceSpec found, using fallback: ml.t3.medium")
         
-        logger.info(f"Initiated creation of app: {identifier}")
+        # Add lifecycle config ARN to ResourceSpec
+        resource_spec['LifecycleConfigArn'] = lcc_arn
+        
+        # Create the app with ResourceSpec
+        create_kwargs = {
+            'DomainId': domain_id,
+            'SpaceName': space_name,
+            'AppType': app_type,
+            'AppName': app_name,
+            'ResourceSpec': resource_spec
+        }
+        
+        sagemaker_client.create_app(**create_kwargs)
+        logger.info(f"Initiated creation of app: {identifier} with LCC: {lcc_arn}")
         
         # Wait for app to be ready
         if not wait_for_app_ready(
@@ -324,7 +366,10 @@ def start_space_app(
 def start_all_spaces(
     sagemaker_client,
     domain_id: str,
-    spaces_data: Dict[str, Any]
+    spaces_data: Dict[str, Any],
+    apps_data: Dict[str, Any],
+    jupyterlab_lcc_arn: str,
+    codeeditor_lcc_arn: str
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Start apps for all spaces to trigger restoration
@@ -333,24 +378,44 @@ def start_all_spaces(
         sagemaker_client: Boto3 SageMaker client
         domain_id: SageMaker domain ID
         spaces_data: Spaces configuration data
+        apps_data: Apps configuration data with ResourceSpecs
+        jupyterlab_lcc_arn: JupyterLab lifecycle config ARN
+        codeeditor_lcc_arn: CodeEditor lifecycle config ARN
         
     Returns:
         Tuple of (successful_count, failed_spaces)
     """
     spaces = spaces_data.get('Spaces', [])
+    apps = apps_data.get('Apps', [])
     
     if not spaces:
         logger.warning("No spaces found in configuration")
         return 0, []
     
+    # Build a lookup map for app ResourceSpecs by space name and app type
+    app_resource_specs = {}
+    for app in apps:
+        if app.get('SpaceName'):
+            key = (app['SpaceName'], app['AppType'])
+            app_resource_specs[key] = app.get('ResourceSpec', {})
+    
     logger.info(f"Starting apps for {len(spaces)} spaces...")
+    logger.info(f"Found ResourceSpecs for {len(app_resource_specs)} apps from original domain")
     
     successful_count = 0
     failed_spaces = []
     
     for space in spaces:
         space_name = space['SpaceName']
-        owner_user_profile = space.get('OwnerUserProfileName', 'unknown')
+        
+        # Get owner user profile name from OwnershipSettings
+        if 'OwnershipSettings' in space and 'OwnerUserProfileName' in space['OwnershipSettings']:
+            owner_user_profile = space['OwnershipSettings']['OwnerUserProfileName']
+        else:
+            owner_user_profile = space.get('OwnerUserProfileName', 'unknown')
+        
+        # Get ResourceSpec for this space's JupyterLab app if available
+        resource_spec = app_resource_specs.get((space_name, 'JupyterLab'))
         
         # Try JupyterLab first
         success, error = start_space_app(
@@ -358,6 +423,8 @@ def start_all_spaces(
             domain_id,
             space_name,
             owner_user_profile,
+            jupyterlab_lcc_arn,
+            default_resource_spec=resource_spec,
             app_type='JupyterLab'
         )
         
@@ -435,9 +502,18 @@ def restore_domain_data(
     
     spaces_data = load_json(str(spaces_file))
     
+    # Load apps configuration (optional - may not exist if no apps were running during discovery)
+    apps_file = output_path / "apps.json"
+    if apps_file.exists():
+        logger.info("Loading apps configuration...")
+        apps_data = load_json(str(apps_file))
+    else:
+        logger.warning("Apps configuration not found - will use default ResourceSpecs")
+        apps_data = {"Apps": []}
+    
     # Start all spaces
     successful_count, failed_spaces = start_all_spaces(
-        sagemaker_client, domain_id, spaces_data
+        sagemaker_client, domain_id, spaces_data, apps_data, jupyterlab_lcc_arn, codeeditor_lcc_arn
     )
     
     # Save restoration status

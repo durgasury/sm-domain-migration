@@ -167,11 +167,11 @@ def wait_for_domain_ready(sagemaker_client, domain_id: str, max_wait_seconds: in
 
 def get_domain_application_id(sagemaker_client, sso_admin_client, domain_id: str) -> Tuple[str, str]:
     """
-    Retrieve the Identity Center application ID and instance ARN for the domain
+    Retrieve the Identity Center application ARN and instance ARN for the domain
     
     Args:
         sagemaker_client: Boto3 SageMaker client
-        sso_admin_client: Boto3 SSO Admin client
+        sso_admin_client: Boto3 SSO Admin client (unused, kept for compatibility)
         domain_id: SageMaker domain ID
         
     Returns:
@@ -183,129 +183,103 @@ def get_domain_application_id(sagemaker_client, sso_admin_client, domain_id: str
         # Get domain details to find the SSO application ARN
         domain_response = sagemaker_client.describe_domain(DomainId=domain_id)
         
-        # The application ARN is in the domain settings for SSO mode
-        if 'DefaultUserSettings' in domain_response and 'SecurityGroups' in domain_response['DefaultUserSettings']:
-            # List all applications and find the one for this domain
-            next_token = None
-            
-            while True:
-                list_params = {}
-                if next_token:
-                    list_params['NextToken'] = next_token
-                
-                apps_response = sso_admin_client.list_applications(**list_params)
-                
-                for app in apps_response.get('Applications', []):
-                    # Check if this application is for our domain
-                    app_arn = app['ApplicationArn']
-                    
-                    # Get application details to check if it's for SageMaker
-                    try:
-                        app_details = sso_admin_client.describe_application(ApplicationArn=app_arn)
-                        
-                        # Check if this is a SageMaker application for our domain
-                        if 'ApplicationProviderArn' in app_details:
-                            provider_arn = app_details['ApplicationProviderArn']
-                            if 'sagemaker' in provider_arn.lower():
-                                # Extract instance ARN from application ARN
-                                # Format: arn:aws:sso::account:application/instance/app-id
-                                instance_arn = '/'.join(app_arn.split('/')[:-1])
-                                logger.info(f"Found application: {app_arn}")
-                                return app_arn, instance_arn
-                    except Exception as e:
-                        logger.debug(f"Error checking application {app_arn}: {str(e)}")
-                        continue
-                
-                next_token = apps_response.get('NextToken')
-                if not next_token:
-                    break
+        # Extract the SingleSignOnApplicationArn from the domain response
+        if 'SingleSignOnApplicationArn' not in domain_response:
+            raise ValueError(
+                f"Domain {domain_id} does not have a SingleSignOnApplicationArn. "
+                "Ensure the domain is in SSO authentication mode."
+            )
         
-        raise ValueError(f"Could not find Identity Center application for domain {domain_id}")
+        application_arn = domain_response['SingleSignOnApplicationArn']
+        
+        # Extract instance ARN from application ARN
+        # Application ARN format: arn:aws:sso::account-id:application/ssoins-xxxxx/apl-xxxxx
+        # Instance ARN format: arn:aws:sso:::instance/ssoins-xxxxx
+        arn_parts = application_arn.split('/')
+        if len(arn_parts) >= 2:
+            instance_id = arn_parts[-2]  # Get the ssoins-xxxxx part
+            instance_arn = f"arn:aws:sso:::instance/{instance_id}"
+        else:
+            raise ValueError(f"Invalid application ARN format: {application_arn}")
+        
+        logger.info(f"Found application ARN: {application_arn}")
+        logger.info(f"Extracted instance ARN: {instance_arn}")
+        
+        return application_arn, instance_arn
         
     except Exception as e:
         logger.error(f"Failed to get domain application ID: {str(e)}")
         raise
 
 
-def lookup_user_identity(identitystore_client, instance_id: str, user_name: str) -> Optional[str]:
+def extract_sso_username(user_profile_name: str) -> str:
     """
-    Look up a user's identity in Identity Center
+    Extract SSO username from user profile name by removing the last 4 characters
+    (hyphen + 3 character suffix)
     
     Args:
-        identitystore_client: Boto3 Identity Store client
-        instance_id: Identity Center instance ID
-        user_name: User name to look up
+        user_profile_name: User profile name (e.g., 'surydurg-ff0')
         
     Returns:
-        User ID if found, None otherwise
+        SSO username (e.g., 'surydurg')
     """
-    try:
-        logger.debug(f"Looking up user identity: {user_name}")
-        
-        # Extract identity store ID from instance ARN
-        # Instance ARN format: arn:aws:sso:::instance/ssoins-xxxxx
-        identity_store_id = instance_id.split('/')[-1]
-        
-        # List users with filter
-        response = identitystore_client.list_users(
-            IdentityStoreId=identity_store_id,
-            Filters=[
-                {
-                    'AttributePath': 'UserName',
-                    'AttributeValue': user_name
-                }
-            ]
-        )
-        
-        users = response.get('Users', [])
-        if users:
-            user_id = users[0]['UserId']
-            logger.debug(f"Found user ID: {user_id}")
-            return user_id
-        
-        logger.warning(f"User not found in Identity Center: {user_name}")
-        return None
-        
-    except Exception as e:
-        logger.error(f"Failed to lookup user {user_name}: {str(e)}")
-        return None
+    # Remove last 4 characters (e.g., '-ff0')
+    if len(user_profile_name) > 4:
+        sso_username = user_profile_name[:-4]
+        logger.debug(f"Extracted SSO username '{sso_username}' from user profile name '{user_profile_name}'")
+        return sso_username
+    else:
+        logger.warning(f"User profile name '{user_profile_name}' is too short to extract SSO username")
+        return user_profile_name
 
 
-def create_application_assignment(
-    sso_admin_client,
-    application_arn: str,
-    principal_id: str,
-    principal_type: str = 'USER'
+def create_user_profile_with_sso(
+    sagemaker_client,
+    domain_id: str,
+    user_profile_name: str,
+    user_settings: Dict[str, Any]
 ) -> bool:
     """
-    Create an application assignment in Identity Center
+    Create a user profile with SSO identity
     
     Args:
-        sso_admin_client: Boto3 SSO Admin client
-        application_arn: Application ARN
-        principal_id: Principal ID (user or group)
-        principal_type: Principal type (USER or GROUP)
+        sagemaker_client: Boto3 SageMaker client
+        domain_id: Domain ID
+        user_profile_name: User profile name
+        user_settings: User settings from original configuration
         
     Returns:
         True if successful
     """
     try:
-        logger.debug(f"Creating application assignment for principal {principal_id}")
+        # Extract SSO username from user profile name
+        sso_username = extract_sso_username(user_profile_name)
         
-        sso_admin_client.create_application_assignment(
-            ApplicationArn=application_arn,
-            PrincipalId=principal_id,
-            PrincipalType=principal_type
-        )
+        logger.info(f"Creating user profile: {user_profile_name} (SSO user: {sso_username})")
         
-        logger.debug(f"Application assignment created successfully")
+        # Build create user profile parameters
+        create_params = {
+            'DomainId': domain_id,
+            'UserProfileName': user_profile_name,
+            'SingleSignOnUserIdentifier': 'UserName',
+            'SingleSignOnUserValue': sso_username
+        }
+        
+        # Add user settings if provided
+        if user_settings:
+            create_params['UserSettings'] = user_settings
+        
+        # Create the user profile
+        sagemaker_client.create_user_profile(**create_params)
+        logger.info(f"User profile creation initiated: {user_profile_name}")
+        
         return True
         
-    except sso_admin_client.exceptions.ConflictException:
-        logger.debug(f"Application assignment already exists for principal {principal_id}")
+    except sagemaker_client.exceptions.ResourceInUseException:
+        logger.debug(f"User profile {user_profile_name} already exists")
         return True
     except Exception as e:
-        logger.error(f"Failed to create application assignment: {str(e)}")
+        logger.error(f"Failed to create user profile {user_profile_name}: {str(e)}")
         return False
 
 
@@ -417,15 +391,15 @@ def recreate_user_profiles(
     domain_default_role: str
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
     """
-    Recreate all user profiles via SSO application assignments
+    Recreate all user profiles using create_user_profile with SSO identity
     
     Args:
         sagemaker_client: Boto3 SageMaker client
-        sso_admin_client: Boto3 SSO Admin client
-        identitystore_client: Boto3 Identity Store client
+        sso_admin_client: Boto3 SSO Admin client (unused, kept for compatibility)
+        identitystore_client: Boto3 Identity Store client (unused, kept for compatibility)
         domain_id: New domain ID
-        application_arn: Identity Center application ARN
-        instance_arn: Identity Center instance ARN
+        application_arn: Identity Center application ARN (unused, kept for compatibility)
+        instance_arn: Identity Center instance ARN (unused, kept for compatibility)
         user_profiles_data: User profiles configuration
         domain_default_role: Domain's default execution role
         
@@ -443,40 +417,25 @@ def recreate_user_profiles(
         original_user_settings = user_profile.get('UserSettings', {})
         
         try:
-            # Look up user identity in Identity Center
-            user_id = lookup_user_identity(identitystore_client, instance_arn, user_profile_name)
-            
-            if not user_id:
-                logger.error(f"Could not find user {user_profile_name} in Identity Center")
-                failed_profiles.append({
-                    'user_profile_name': user_profile_name,
-                    'error': 'User not found in Identity Center'
-                })
-                continue
-            
-            # Create application assignment
-            if not create_application_assignment(sso_admin_client, application_arn, user_id):
-                logger.error(f"Failed to create application assignment for {user_profile_name}")
-                failed_profiles.append({
-                    'user_profile_name': user_profile_name,
-                    'error': 'Failed to create application assignment'
-                })
-                continue
-            
-            # Wait for user profile to be automatically created
-            if not wait_for_user_profile_creation(sagemaker_client, domain_id, user_profile_name):
-                logger.error(f"User profile {user_profile_name} was not created automatically")
-                failed_profiles.append({
-                    'user_profile_name': user_profile_name,
-                    'error': 'User profile not created automatically'
-                })
-                continue
-            
-            # Update user profile settings if needed
-            if not update_user_profile_settings(
-                sagemaker_client, domain_id, user_profile_name, original_user_settings, domain_default_role
+            # Create user profile with SSO identity
+            if not create_user_profile_with_sso(
+                sagemaker_client, domain_id, user_profile_name, original_user_settings
             ):
-                logger.warning(f"Failed to update settings for {user_profile_name}, but profile was created")
+                logger.error(f"Failed to create user profile {user_profile_name}")
+                failed_profiles.append({
+                    'user_profile_name': user_profile_name,
+                    'error': 'Failed to create user profile'
+                })
+                continue
+            
+            # Wait for user profile to be ready
+            if not wait_for_user_profile_creation(sagemaker_client, domain_id, user_profile_name):
+                logger.error(f"User profile {user_profile_name} did not reach InService status")
+                failed_profiles.append({
+                    'user_profile_name': user_profile_name,
+                    'error': 'User profile did not reach InService status'
+                })
+                continue
             
             # Get new user profile ARN
             new_profile_response = sagemaker_client.describe_user_profile(
@@ -521,7 +480,12 @@ def create_space(
     """
     try:
         space_name = space_config['SpaceName']
-        owner_user_profile = space_config['OwnerUserProfileName']
+        
+        # Get owner user profile name from OwnershipSettings
+        if 'OwnershipSettings' not in space_config or 'OwnerUserProfileName' not in space_config['OwnershipSettings']:
+            raise ValueError(f"Could not find OwnershipSettings.OwnerUserProfileName for space {space_name}")
+        
+        owner_user_profile = space_config['OwnershipSettings']['OwnerUserProfileName']
         
         logger.info(f"Creating space: {space_name} (owner: {owner_user_profile})")
         
@@ -541,8 +505,15 @@ def create_space(
         if 'SpaceSettings' in space_config:
             create_params['SpaceSettings'] = space_config['SpaceSettings']
         
+        # Filter out SageMaker system tags (tags starting with 'sagemaker:')
         if 'Tags' in space_config:
-            create_params['Tags'] = space_config['Tags']
+            filtered_tags = [
+                tag for tag in space_config['Tags']
+                if not tag.get('Key', '').startswith('sagemaker:')
+            ]
+            if filtered_tags:
+                create_params['Tags'] = filtered_tags
+                logger.debug(f"Filtered {len(space_config['Tags']) - len(filtered_tags)} SageMaker system tags")
         
         # Create the space
         response = sagemaker_client.create_space(**create_params)
