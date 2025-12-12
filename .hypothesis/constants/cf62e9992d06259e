@@ -1,4 +1,0 @@
-# file: /Users/surydurg/Desktop/sm-domain-migration/scripts/utils/config_schemas.py
-# hypothesis_version: 6.148.2
-
-['AppNetworkAccessType', 'AuthMode', 'DefaultUserSettings', 'DomainArn', 'DomainId', 'DomainName', 'DomainSettings', 'HomeEfsFileSystemId', 'OwnerUserProfileName', 'SecurityGroupIds', 'SpaceArn', 'SpaceName', 'SpaceSettings', 'SpaceSharingSettings', 'Spaces', 'SubnetIds', 'UserProfileArn', 'UserProfileName', 'UserProfiles', 'UserSettings', 'VpcId', 'additionalProperties', 'array', 'domain', 'domain_id', 'failed_apps', 'integer', 'items', 'new', 'object', 'old', 'properties', 'required', 's3_bucket', 's3_prefix', 'spaces', 'string', 'successful_apps', 'timestamp', 'total_apps', 'type', 'user_profiles']
