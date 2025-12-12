@@ -245,6 +245,7 @@ def list_apps(sagemaker_client, domain_id: str) -> List[Dict[str, Any]]:
     try:
         logger.info(f"Listing apps for domain {domain_id}")
         apps = []
+        app_status_counts = {}
         next_token = None
         
         while True:
@@ -259,21 +260,35 @@ def list_apps(sagemaker_client, domain_id: str) -> List[Dict[str, Any]]:
                 )
             
             for app in response.get('Apps', []):
-                # Only capture JupyterLab and CodeEditor apps that are InService
-                if app['AppType'] in ['JupyterLab', 'CodeEditor'] and app['Status'] == 'InService':
+                # Capture all JupyterLab and CodeEditor apps regardless of status
+                if app['AppType'] in ['JupyterLab', 'CodeEditor']:
                     apps.append({
                         'DomainId': app['DomainId'],
                         'UserProfileName': app.get('UserProfileName'),
                         'SpaceName': app.get('SpaceName'),
                         'AppType': app['AppType'],
-                        'AppName': app['AppName']
+                        'AppName': app['AppName'],
+                        'Status': app['Status']
                     })
+                    
+                    # Count apps by status
+                    status = app['Status']
+                    app_status_counts[status] = app_status_counts.get(status, 0) + 1
             
             next_token = response.get('NextToken')
             if not next_token:
                 break
         
-        logger.info(f"Found {len(apps)} InService JupyterLab/CodeEditor apps")
+        # Log status summary
+        logger.info(f"Found {len(apps)} JupyterLab/CodeEditor apps:")
+        for status, count in sorted(app_status_counts.items()):
+            logger.info(f"  - {status}: {count}")
+        
+        # Specifically log failed apps count
+        failed_count = app_status_counts.get('Failed', 0)
+        if failed_count > 0:
+            logger.warning(f"Found {failed_count} Failed apps")
+        
         return apps
         
     except Exception as e:

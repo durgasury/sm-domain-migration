@@ -28,17 +28,23 @@ from utils import (
 logger = get_logger(__name__)
 
 
-def generate_backup_lifecycle_script(s3_bucket: str, s3_prefix: str) -> str:
+def generate_backup_lifecycle_script(s3_bucket: str, s3_prefix: str, backup_efs: bool = True) -> str:
     """
     Generate lifecycle configuration script for backing up data to S3
     
     Args:
         s3_bucket: S3 bucket name
         s3_prefix: S3 prefix (optional)
+        backup_efs: Whether to backup EFS data (default: True)
         
     Returns:
         Bash script content as string
     """
+    # Build exclude parameters based on backup_efs flag
+    exclude_params = '--exclude ".cache/*" --exclude "lost+found/*"'
+    if not backup_efs:
+        exclude_params += ' --exclude "user-default-efs/*"'
+    
     script = f"""#!/bin/bash
 set -e
 
@@ -64,9 +70,10 @@ echo "Starting backup to $S3_PATH"
 echo "Domain ID: $SM_BCK_DOMAIN_ID"
 echo "Space Name: $SM_BCK_SPACE_NAME"
 echo "User Profile: $SM_BCK_USER_PROFILE_NAME"
+echo "Backup EFS: {'Yes' if backup_efs else 'No'}"
 
-# Sync user data to S3, excluding cache directories
-aws s3 sync /home/sagemaker-user "$S3_PATH" --exclude ".cache/*" --exclude "lost+found/*"
+# Sync user data to S3, excluding cache directories and optionally EFS
+aws s3 sync /home/sagemaker-user "$S3_PATH" {exclude_params}
 
 echo "Backup completed successfully"
 """
@@ -77,7 +84,8 @@ def create_lifecycle_config(
     sagemaker_client,
     app_type: str,
     s3_bucket: str,
-    s3_prefix: str
+    s3_prefix: str,
+    backup_efs: bool = True
 ) -> str:
     """
     Create a Studio lifecycle configuration for backup
@@ -87,13 +95,14 @@ def create_lifecycle_config(
         app_type: App type (JupyterLab or CodeEditor)
         s3_bucket: S3 bucket name
         s3_prefix: S3 prefix
+        backup_efs: Whether to backup EFS data
         
     Returns:
         Lifecycle configuration ARN
     """
     try:
         lcc_name = f"backup-{app_type.lower()}-{int(time.time())}"
-        script_content = generate_backup_lifecycle_script(s3_bucket, s3_prefix)
+        script_content = generate_backup_lifecycle_script(s3_bucket, s3_prefix, backup_efs)
         
         # Encode script in base64
         script_encoded = base64.b64encode(script_content.encode('utf-8')).decode('utf-8')
@@ -169,18 +178,19 @@ def attach_lifecycle_config_to_domain(
 
 def list_active_apps(sagemaker_client, domain_id: str) -> List[Dict[str, Any]]:
     """
-    List all active JupyterLab and CodeEditor apps in the domain
+    List all JupyterLab and CodeEditor apps in the domain, excluding failed ones
     
     Args:
         sagemaker_client: Boto3 SageMaker client
         domain_id: SageMaker domain ID
         
     Returns:
-        List of app dictionaries with details
+        List of app dictionaries with details (excluding failed apps)
     """
     try:
-        logger.info(f"Listing active apps for domain {domain_id}")
+        logger.info(f"Listing apps for domain {domain_id}")
         apps = []
+        app_status_counts = {}
         next_token = None
         
         while True:
@@ -195,25 +205,42 @@ def list_active_apps(sagemaker_client, domain_id: str) -> List[Dict[str, Any]]:
                 )
             
             for app in response.get('Apps', []):
-                # Filter for JupyterLab and CodeEditor apps that are InService
-                if app['AppType'] in ['JupyterLab', 'CodeEditor'] and app['Status'] == 'InService':
-                    apps.append({
-                        'DomainId': app['DomainId'],
-                        'UserProfileName': app.get('UserProfileName'),
-                        'SpaceName': app.get('SpaceName'),
-                        'AppType': app['AppType'],
-                        'AppName': app['AppName']
-                    })
+                # Filter for JupyterLab and CodeEditor apps
+                if app['AppType'] in ['JupyterLab', 'CodeEditor']:
+                    status = app['Status']
+                    app_status_counts[status] = app_status_counts.get(status, 0) + 1
+                    
+                    # Skip failed apps but include all others (InService, Pending, etc.)
+                    if status != 'Failed':
+                        apps.append({
+                            'DomainId': app['DomainId'],
+                            'UserProfileName': app.get('UserProfileName'),
+                            'SpaceName': app.get('SpaceName'),
+                            'AppType': app['AppType'],
+                            'AppName': app['AppName'],
+                            'Status': status
+                        })
             
             next_token = response.get('NextToken')
             if not next_token:
                 break
         
-        logger.info(f"Found {len(apps)} active JupyterLab/CodeEditor apps")
+        # Log status summary
+        total_apps = sum(app_status_counts.values())
+        logger.info(f"Found {total_apps} JupyterLab/CodeEditor apps:")
+        for status, count in sorted(app_status_counts.items()):
+            logger.info(f"  - {status}: {count}")
+        
+        # Specifically log failed apps count
+        failed_count = app_status_counts.get('Failed', 0)
+        if failed_count > 0:
+            logger.warning(f"Skipping {failed_count} Failed apps")
+        
+        logger.info(f"Will process {len(apps)} apps (excluding failed)")
         return apps
         
     except Exception as e:
-        logger.error(f"Failed to list active apps: {str(e)}")
+        logger.error(f"Failed to list apps: {str(e)}")
         raise
 
 
@@ -645,7 +672,8 @@ def backup_domain_data(
     domain_id: str,
     s3_bucket: str,
     s3_prefix: str,
-    config_dir: str
+    config_dir: str,
+    backup_efs: bool = True
 ) -> None:
     """
     Main backup function to sync user data to S3
@@ -655,6 +683,7 @@ def backup_domain_data(
         s3_bucket: S3 bucket name for backup
         s3_prefix: S3 prefix for backup
         config_dir: Directory containing configuration files
+        backup_efs: Whether to backup EFS data (default: True)
     """
     # Initialize AWS client
     sagemaker_client = get_sagemaker_client()
@@ -674,10 +703,10 @@ def backup_domain_data(
     # Create lifecycle configurations
     logger.info("Creating lifecycle configurations...")
     jupyterlab_lcc_arn = create_lifecycle_config(
-        sagemaker_client, 'JupyterLab', s3_bucket, s3_prefix
+        sagemaker_client, 'JupyterLab', s3_bucket, s3_prefix, backup_efs
     )
     codeeditor_lcc_arn = create_lifecycle_config(
-        sagemaker_client, 'CodeEditor', s3_bucket, s3_prefix
+        sagemaker_client, 'CodeEditor', s3_bucket, s3_prefix, backup_efs
     )
     
     # Attach lifecycle configurations to domain
@@ -772,6 +801,18 @@ def main():
         help='Directory for configuration files (default: ./migration_data)'
     )
     parser.add_argument(
+        '--backup-efs',
+        action='store_true',
+        default=True,
+        help='Backup EFS data (default: True)'
+    )
+    parser.add_argument(
+        '--no-backup-efs',
+        action='store_false',
+        dest='backup_efs',
+        help='Skip EFS data backup'
+    )
+    parser.add_argument(
         '--log-level',
         default='INFO',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -788,7 +829,8 @@ def main():
             args.domain_id,
             args.s3_bucket,
             args.s3_prefix,
-            args.config_dir
+            args.config_dir,
+            args.backup_efs
         )
         sys.exit(0)
     except Exception as e:

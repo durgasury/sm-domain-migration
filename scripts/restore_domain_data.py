@@ -29,17 +29,23 @@ from utils import (
 logger = get_logger(__name__)
 
 
-def generate_restore_lifecycle_script(s3_bucket: str, s3_prefix: str) -> str:
+def generate_restore_lifecycle_script(s3_bucket: str, s3_prefix: str, backup_efs: bool = True) -> str:
     """
     Generate lifecycle configuration script for restoring data from S3
     
     Args:
         s3_bucket: S3 bucket name
         s3_prefix: S3 prefix (optional)
+        backup_efs: Whether EFS data was backed up (default: True)
         
     Returns:
         Bash script content as string
     """
+    # Build exclude parameters based on backup_efs flag
+    exclude_params = '--exclude ".cache/*" --exclude "lost+found/*"'
+    if not backup_efs:
+        exclude_params += ' --exclude "user-default-efs/*"'
+    
     script = f"""#!/bin/bash
 set -e
 
@@ -65,11 +71,12 @@ echo "Starting restoration from $S3_PATH"
 echo "Domain ID: $SM_RST_DOMAIN_ID"
 echo "Space Name: $SM_RST_SPACE_NAME"
 echo "User Profile: $SM_RST_USER_PROFILE_NAME"
+echo "Restore EFS: {'Yes' if backup_efs else 'No'}"
 
 # Check if S3 path exists
 if aws s3 ls "$S3_PATH" > /dev/null 2>&1; then
-    # Sync data from S3 to user volume, excluding cache directories
-    aws s3 sync "$S3_PATH" /home/sagemaker-user --exclude ".cache/*" --exclude "lost+found/*"
+    # Sync data from S3 to user volume, excluding cache directories and optionally EFS
+    aws s3 sync "$S3_PATH" /home/sagemaker-user {exclude_params}
     echo "Restoration completed successfully"
 else
     echo "Warning: No backup found at $S3_PATH"
@@ -83,7 +90,8 @@ def create_lifecycle_config(
     sagemaker_client,
     app_type: str,
     s3_bucket: str,
-    s3_prefix: str
+    s3_prefix: str,
+    backup_efs: bool = True
 ) -> str:
     """
     Create a Studio lifecycle configuration for restoration
@@ -93,13 +101,14 @@ def create_lifecycle_config(
         app_type: App type (JupyterLab or CodeEditor)
         s3_bucket: S3 bucket name
         s3_prefix: S3 prefix
+        backup_efs: Whether EFS data was backed up
         
     Returns:
         Lifecycle configuration ARN
     """
     try:
         lcc_name = f"restore-{app_type.lower()}-{int(time.time())}"
-        script_content = generate_restore_lifecycle_script(s3_bucket, s3_prefix)
+        script_content = generate_restore_lifecycle_script(s3_bucket, s3_prefix, backup_efs)
         
         # Encode script in base64
         script_encoded = base64.b64encode(script_content.encode('utf-8')).decode('utf-8')
@@ -475,14 +484,33 @@ def start_all_spaces(
         return 0, []
     
     # Build a lookup map for app ResourceSpecs by space name and app type
+    # Skip failed apps from the original domain
     app_resource_specs = {}
+    app_status_counts = {}
+    
     for app in apps:
         if app.get('SpaceName'):
-            key = (app['SpaceName'], app['AppType'])
-            app_resource_specs[key] = app.get('ResourceSpec', {})
+            status = app.get('Status', 'Unknown')
+            app_status_counts[status] = app_status_counts.get(status, 0) + 1
+            
+            # Only use ResourceSpecs from non-failed apps
+            if status != 'Failed':
+                key = (app['SpaceName'], app['AppType'])
+                app_resource_specs[key] = app.get('ResourceSpec', {})
+    
+    # Log status summary if we have status information
+    if app_status_counts:
+        total_apps = sum(app_status_counts.values())
+        logger.info(f"Found {total_apps} apps from original domain:")
+        for status, count in sorted(app_status_counts.items()):
+            logger.info(f"  - {status}: {count}")
+        
+        failed_count = app_status_counts.get('Failed', 0)
+        if failed_count > 0:
+            logger.warning(f"Skipping ResourceSpecs from {failed_count} Failed apps")
     
     logger.info(f"Starting apps for {len(spaces)} spaces in parallel...")
-    logger.info(f"Found ResourceSpecs for {len(app_resource_specs)} apps from original domain")
+    logger.info(f"Using ResourceSpecs from {len(app_resource_specs)} non-failed apps")
     
     failed_spaces = []
     created_apps = []
@@ -569,7 +597,8 @@ def restore_domain_data(
     domain_id: str,
     s3_bucket: str,
     s3_prefix: str,
-    config_dir: str
+    config_dir: str,
+    backup_efs: bool = True
 ) -> None:
     """
     Main restoration function to sync data from S3 back to user volumes
@@ -579,6 +608,7 @@ def restore_domain_data(
         s3_bucket: S3 bucket name for backup
         s3_prefix: S3 prefix for backup
         config_dir: Directory containing configuration files
+        backup_efs: Whether EFS data was backed up (default: True)
     """
     # Initialize AWS clients
     sagemaker_client = get_sagemaker_client()
@@ -607,10 +637,10 @@ def restore_domain_data(
     # Create lifecycle configurations
     logger.info("Creating lifecycle configurations...")
     jupyterlab_lcc_arn = create_lifecycle_config(
-        sagemaker_client, 'JupyterLab', s3_bucket, s3_prefix
+        sagemaker_client, 'JupyterLab', s3_bucket, s3_prefix, backup_efs
     )
     codeeditor_lcc_arn = create_lifecycle_config(
-        sagemaker_client, 'CodeEditor', s3_bucket, s3_prefix
+        sagemaker_client, 'CodeEditor', s3_bucket, s3_prefix, backup_efs
     )
     
     # Attach lifecycle configurations to domain
@@ -706,6 +736,18 @@ def main():
         help='Directory containing configuration files (default: ./migration_data)'
     )
     parser.add_argument(
+        '--backup-efs',
+        action='store_true',
+        default=True,
+        help='EFS data was backed up (default: True)'
+    )
+    parser.add_argument(
+        '--no-backup-efs',
+        action='store_false',
+        dest='backup_efs',
+        help='EFS data was not backed up'
+    )
+    parser.add_argument(
         '--log-level',
         default='INFO',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -722,7 +764,8 @@ def main():
             args.domain_id,
             args.s3_bucket,
             args.s3_prefix,
-            args.config_dir
+            args.config_dir,
+            args.backup_efs
         )
         sys.exit(0)
     except Exception as e:
