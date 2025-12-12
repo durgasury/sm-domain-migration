@@ -214,23 +214,50 @@ def get_domain_application_id(sagemaker_client, sso_admin_client, domain_id: str
 
 def extract_sso_username(user_profile_name: str) -> str:
     """
-    Extract SSO username from user profile name by removing the last 4 characters
-    (hyphen + 3 character suffix)
+    Extract SSO username from user profile name by removing suffix after last hyphen
+    
+    Handles formats:
+    1. Legacy: 'surydurg-ff0' -> 'surydurg'
+    2. Email-based: 'priv-rekapall-med-usc-edu-abc' -> 'priv.rekapall@med.usc.edu'
     
     Args:
-        user_profile_name: User profile name (e.g., 'surydurg-ff0')
+        user_profile_name: User profile name
         
     Returns:
-        SSO username (e.g., 'surydurg')
+        SSO username
     """
-    # Remove last 4 characters (e.g., '-ff0')
-    if len(user_profile_name) > 4:
-        sso_username = user_profile_name[:-4]
-        logger.debug(f"Extracted SSO username '{sso_username}' from user profile name '{user_profile_name}'")
+    # Remove everything after the last hyphen (suffix)
+    if '-' in user_profile_name:
+        base_name = user_profile_name.rsplit('-', 1)[0]
+    else:
+        logger.warning(f"No hyphen found in user profile name '{user_profile_name}'")
+        return user_profile_name
+    
+    # Check if this looks like an email format (multiple hyphens remaining)
+    if base_name.count('-') >= 2:
+        # Convert to email format: replace hyphens with dots, add @ before domain
+        # Example: 'priv-rekapall-med-usc-edu' -> 'priv.rekapall@med.usc.edu'
+        parts = base_name.split('-')
+        
+        if len(parts) >= 4:
+            # Assume first 2 parts are username, rest is domain
+            username_parts = parts[:2]
+            domain_parts = parts[2:]
+        else:
+            # Fallback: first part is username, rest is domain
+            username_parts = parts[:1]
+            domain_parts = parts[1:]
+        
+        username = '.'.join(username_parts)
+        domain = '.'.join(domain_parts)
+        sso_username = f"{username}@{domain}"
+        
+        logger.debug(f"Extracted SSO username '{sso_username}' from user profile name '{user_profile_name}' (email format)")
         return sso_username
     else:
-        logger.warning(f"User profile name '{user_profile_name}' is too short to extract SSO username")
-        return user_profile_name
+        # Simple format: just return the base name
+        logger.debug(f"Extracted SSO username '{base_name}' from user profile name '{user_profile_name}' (simple format)")
+        return base_name
 
 
 def create_user_profile_with_sso(
@@ -275,7 +302,7 @@ def create_user_profile_with_sso(
         
         return True
         
-    except sagemaker_client.exceptions.ResourceInUseException:
+    except sagemaker_client.exceptions.ResourceInUse:
         logger.debug(f"User profile {user_profile_name} already exists")
         return True
     except Exception as e:
