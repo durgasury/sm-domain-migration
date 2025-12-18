@@ -73,7 +73,7 @@ echo "User Profile: $SM_BCK_USER_PROFILE_NAME"
 echo "Backup EFS: {'Yes' if backup_efs else 'No'}"
 
 # Sync user data to S3, excluding cache directories and optionally EFS
-aws s3 sync /home/sagemaker-user "$S3_PATH" {exclude_params}
+nohup aws s3 sync /home/sagemaker-user "$S3_PATH" {exclude_params} > sync.log 2>&1 &
 
 echo "Backup completed successfully"
 """

@@ -76,7 +76,7 @@ echo "Restore EFS: {'Yes' if backup_efs else 'No'}"
 # Check if S3 path exists
 if aws s3 ls "$S3_PATH" > /dev/null 2>&1; then
     # Sync data from S3 to user volume, excluding cache directories and optionally EFS
-    aws s3 sync "$S3_PATH" /home/sagemaker-user {exclude_params}
+    nohup aws s3 sync "$S3_PATH" /home/sagemaker-user {exclude_params} > sync.log 2>&1 &
     echo "Restoration completed successfully"
 else
     echo "Warning: No backup found at $S3_PATH"

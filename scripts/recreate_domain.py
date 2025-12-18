@@ -303,7 +303,7 @@ def create_user_profile_with_sso(
         return True
         
     except sagemaker_client.exceptions.ResourceInUse:
-        logger.debug(f"User profile {user_profile_name} already exists")
+        logger.info(f"User profile {user_profile_name} already exists, skipping creation")
         return True
     except Exception as e:
         logger.error(f"Failed to create user profile {user_profile_name}: {str(e)}")
@@ -543,16 +543,33 @@ def create_space(
                 logger.debug(f"Filtered {len(space_config['Tags']) - len(filtered_tags)} SageMaker system tags")
         
         # Create the space
-        response = sagemaker_client.create_space(**create_params)
-        new_space_arn = response['SpaceArn']
-        
-        logger.info(f"Space creation initiated: {space_name}")
-        
-        # Wait for space to be ready
-        wait_for_space_ready(sagemaker_client, domain_id, space_name)
-        
-        logger.info(f"Space created successfully: {space_name}")
-        return new_space_arn
+        try:
+            response = sagemaker_client.create_space(**create_params)
+            new_space_arn = response['SpaceArn']
+            
+            logger.info(f"Space creation initiated: {space_name}")
+            
+            # Wait for space to be ready
+            wait_for_space_ready(sagemaker_client, domain_id, space_name)
+            
+            logger.info(f"Space created successfully: {space_name}")
+            return new_space_arn
+            
+        except sagemaker_client.exceptions.ResourceInUse:
+            logger.info(f"Space {space_name} already exists, getting existing ARN")
+            
+            # Get existing space ARN
+            existing_response = sagemaker_client.describe_space(
+                DomainId=domain_id,
+                SpaceName=space_name
+            )
+            existing_space_arn = existing_response['SpaceArn']
+            
+            # Wait for space to be ready if it's not already
+            wait_for_space_ready(sagemaker_client, domain_id, space_name)
+            
+            logger.info(f"Using existing space: {space_name}")
+            return existing_space_arn
         
     except Exception as e:
         logger.error(f"Failed to create space {space_config.get('SpaceName')}: {str(e)}")
@@ -695,13 +712,14 @@ def build_resource_mapping(
     return mapping
 
 
-def recreate_domain_resources(config_dir: str, new_domain_name: Optional[str] = None) -> None:
+def recreate_domain_resources(config_dir: str, new_domain_name: Optional[str] = None, resume_domain_id: Optional[str] = None) -> None:
     """
     Main recreation function to recreate domain and all resources
     
     Args:
         config_dir: Directory containing configuration files
         new_domain_name: Optional new domain name
+        resume_domain_id: Optional existing domain ID to resume from
     """
     # Initialize AWS clients
     sagemaker_client = get_sagemaker_client()
@@ -725,10 +743,35 @@ def recreate_domain_resources(config_dir: str, new_domain_name: Optional[str] = 
     logger.info(f"Spaces to recreate: {len(spaces_data.get('Spaces', []))}")
     logger.info("=" * 60)
     
-    # Create new domain
-    logger.info("Step 1: Creating new domain...")
-    new_domain_id = create_domain(sagemaker_client, domain_config, new_domain_name)
-    logger.info(f"New domain ID: {new_domain_id}")
+    # Create new domain or use existing one
+    if resume_domain_id:
+        logger.info("Step 1: Resuming with existing domain...")
+        new_domain_id = resume_domain_id
+        logger.info(f"Using existing domain ID: {new_domain_id}")
+        
+        # Verify domain exists and is accessible
+        try:
+            domain_response = sagemaker_client.describe_domain(DomainId=new_domain_id)
+            domain_status = domain_response.get('Status')
+            logger.info(f"Domain status: {domain_status}")
+            
+            if domain_status != 'InService':
+                logger.warning(f"Domain is not in InService status: {domain_status}")
+                if domain_status in ['Failed', 'Delete_Failed']:
+                    raise ValueError(f"Cannot resume from domain in {domain_status} status")
+                
+                # Wait for domain to be ready if it's still being created
+                logger.info("Waiting for domain to be InService...")
+                if not wait_for_domain_ready(sagemaker_client, new_domain_id):
+                    raise ValueError("Domain failed to reach InService status")
+        except sagemaker_client.exceptions.ResourceNotFound:
+            raise ValueError(f"Domain {new_domain_id} not found")
+        except Exception as e:
+            raise ValueError(f"Failed to access domain {new_domain_id}: {str(e)}")
+    else:
+        logger.info("Step 1: Creating new domain...")
+        new_domain_id = create_domain(sagemaker_client, domain_config, new_domain_name)
+        logger.info(f"New domain ID: {new_domain_id}")
     
     # Get domain application ID
     logger.info("Step 2: Retrieving Identity Center application...")
@@ -826,6 +869,10 @@ def main():
         help='New domain name (optional, defaults to original name with timestamp)'
     )
     parser.add_argument(
+        '--resume-domain-id',
+        help='Resume from existing domain ID instead of creating new domain'
+    )
+    parser.add_argument(
         '--log-level',
         default='INFO',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -837,8 +884,13 @@ def main():
     # Setup logging
     setup_logging(level=args.log_level)
     
+    # Validate arguments
+    if args.new_domain_name and args.resume_domain_id:
+        logger.error("Cannot specify both --new-domain-name and --resume-domain-id")
+        sys.exit(1)
+    
     try:
-        recreate_domain_resources(args.config_dir, args.new_domain_name)
+        recreate_domain_resources(args.config_dir, args.new_domain_name, args.resume_domain_id)
         sys.exit(0)
     except Exception as e:
         logger.error(f"Recreation failed: {str(e)}")
