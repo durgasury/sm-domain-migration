@@ -178,7 +178,7 @@ def attach_lifecycle_config_to_domain(
 
 def list_active_apps(sagemaker_client, domain_id: str) -> List[Dict[str, Any]]:
     """
-    List all JupyterLab and CodeEditor apps in the domain, excluding failed ones
+    List all JupyterLab and CodeEditor apps in the domain for backup (excluding failed)
     
     Args:
         sagemaker_client: Boto3 SageMaker client
@@ -210,7 +210,8 @@ def list_active_apps(sagemaker_client, domain_id: str) -> List[Dict[str, Any]]:
                     status = app['Status']
                     app_status_counts[status] = app_status_counts.get(status, 0) + 1
                     
-                    # Skip failed apps but include all others (InService, Pending, etc.)
+                    # Include all non-failed apps for backup processing
+                    # Only skip Failed apps
                     if status != 'Failed':
                         apps.append({
                             'DomainId': app['DomainId'],
@@ -231,12 +232,12 @@ def list_active_apps(sagemaker_client, domain_id: str) -> List[Dict[str, Any]]:
         for status, count in sorted(app_status_counts.items()):
             logger.info(f"  - {status}: {count}")
         
-        # Specifically log failed apps count
+        # Log counts of skipped apps
         failed_count = app_status_counts.get('Failed', 0)
         if failed_count > 0:
             logger.warning(f"Skipping {failed_count} Failed apps")
         
-        logger.info(f"Will process {len(apps)} apps (excluding failed)")
+        logger.info(f"Will process {len(apps)} apps for backup (excluding failed)")
         return apps
         
     except Exception as e:
@@ -388,9 +389,7 @@ def delete_app(
         else:
             identifier = f"{user_profile_name}/{app_type}/{app_name}"
         
-        logger.info(f"Deleting app: {identifier}")
-        
-        # Get app details before deletion to capture ResourceSpec
+        # Get app details to check status and capture ResourceSpec
         describe_kwargs = {
             'DomainId': domain_id,
             'AppType': app_type,
@@ -404,22 +403,30 @@ def delete_app(
         
         app_details = sagemaker_client.describe_app(**describe_kwargs)
         resource_spec = app_details.get('ResourceSpec', {})
-        logger.info(f"Captured ResourceSpec for app: {identifier}")
+        current_status = app_details.get('Status', 'Unknown')
         
-        # Delete the app
-        delete_kwargs = {
-            'DomainId': domain_id,
-            'AppType': app_type,
-            'AppName': app_name
-        }
+        logger.info(f"Processing app: {identifier} (status: {current_status})")
         
-        if user_profile_name:
-            delete_kwargs['UserProfileName'] = user_profile_name
-        if space_name:
-            delete_kwargs['SpaceName'] = space_name
-        
-        sagemaker_client.delete_app(**delete_kwargs)
-        logger.info(f"Initiated deletion of app: {identifier}")
+        # Only delete InService apps, skip others
+        if current_status == 'InService':
+            logger.info(f"Deleting InService app: {identifier}")
+            
+            # Delete the app
+            delete_kwargs = {
+                'DomainId': domain_id,
+                'AppType': app_type,
+                'AppName': app_name
+            }
+            
+            if user_profile_name:
+                delete_kwargs['UserProfileName'] = user_profile_name
+            if space_name:
+                delete_kwargs['SpaceName'] = space_name
+            
+            sagemaker_client.delete_app(**delete_kwargs)
+            logger.info(f"Initiated deletion of app: {identifier}")
+        else:
+            logger.info(f"Skipping deletion of {current_status} app: {identifier}")
         
         return True, None, resource_spec
         
@@ -541,8 +548,8 @@ def restart_apps_parallel(
                 'phase': 'deletion'
             })
     
-    # Wait for all deletions to complete
-    logger.info("Waiting for all app deletions to complete...")
+    # Wait for all deletions to complete (only for InService apps that were actually deleted)
+    logger.info("Waiting for app deletions to complete...")
     for app_info in active_apps:
         # Skip apps that failed to delete
         app_key = (
@@ -554,24 +561,30 @@ def restart_apps_parallel(
         if app_key not in app_resource_specs:
             continue
         
-        if not wait_for_app_deleted(
-            sagemaker_client,
-            app_info['DomainId'],
-            app_info.get('UserProfileName'),
-            app_info.get('SpaceName'),
-            app_info['AppType'],
-            app_info['AppName']
-        ):
-            failed_apps.append({
-                'user_profile_name': app_info.get('UserProfileName'),
-                'space_name': app_info.get('SpaceName'),
-                'app_type': app_info['AppType'],
-                'app_name': app_info['AppName'],
-                'error': 'Timeout waiting for app deletion',
-                'phase': 'deletion_wait'
-            })
-            # Remove from resource specs so we don't try to recreate
-            del app_resource_specs[app_key]
+        # Only wait for deletion if the app was InService (and thus actually deleted)
+        app_status = app_info.get('Status', 'Unknown')
+        if app_status == 'InService':
+            if not wait_for_app_deleted(
+                sagemaker_client,
+                app_info['DomainId'],
+                app_info.get('UserProfileName'),
+                app_info.get('SpaceName'),
+                app_info['AppType'],
+                app_info['AppName']
+            ):
+                failed_apps.append({
+                    'user_profile_name': app_info.get('UserProfileName'),
+                    'space_name': app_info.get('SpaceName'),
+                    'app_type': app_info['AppType'],
+                    'app_name': app_info['AppName'],
+                    'error': 'Timeout waiting for app deletion',
+                    'phase': 'deletion_wait'
+                })
+                # Remove from resource specs so we don't try to recreate
+                del app_resource_specs[app_key]
+        else:
+            # For non-InService apps, we didn't delete them, so no need to wait
+            logger.debug(f"Skipping deletion wait for {app_status} app: {app_info.get('SpaceName') or app_info.get('UserProfileName')}/{app_info['AppType']}/{app_info['AppName']}")
     
     logger.info(f"Phase 1 complete. {len(app_resource_specs)} apps ready for recreation")
     

@@ -104,6 +104,9 @@ def create_domain(sagemaker_client, domain_config: Dict[str, Any], new_domain_na
         if 'DomainSettings' in domain_config:
             create_params['DomainSettings'] = domain_config['DomainSettings']
         
+        if 'DefaultSpaceSettings' in domain_config:
+            create_params['DefaultSpaceSettings'] = domain_config['DefaultSpaceSettings']
+        
         if 'AppNetworkAccessType' in domain_config:
             create_params['AppNetworkAccessType'] = domain_config['AppNetworkAccessType']
         

@@ -1,6 +1,6 @@
 # SageMaker Studio Domain Migration Tool
 
-A comprehensive Python-based tool for migrating AWS SageMaker Studio domains between AWS Organizations. This tool automates the process of capturing domain configurations, backing up user data, recreating the domain in a new organizational context, and restoring all data and configurations.
+A comprehensive Python-based tool for migrating Amazon SageMaker Studio domains between AWS Organizations. This tool automates the process of capturing domain configurations, backing up user data, recreating the domain in a new organizational context, and restoring all data and configurations.
 
 ## Table of Contents
 
@@ -21,8 +21,27 @@ When an AWS account moves between AWS Organizations, SSO-based SageMaker Studio 
 1. **Discovering** all domain configurations, user profiles, and spaces
 2. **Backing up** user data from EBS volumes to S3
 3. **Recreating** the domain and all resources in the new organizational context
-4. **Retagging** SageMaker resources to reference the new domain
-5. **Restoring** user data from S3 back to the new domain
+4. **Assigning** users to the new domain via Identity Center
+5. **Retagging** SageMaker resources to reference the new domain
+6. **Restoring** user data from S3 back to the new domain
+
+## Key Features
+
+### Enhanced Reliability
+- **Parallel Processing**: Apps are created in parallel with throttling to avoid API limits
+- **Resume Functionality**: Resume domain recreation from existing domains if the script fails
+- **Smart App Filtering**: Only processes InService apps, skips Failed/Deleted apps
+- **Robust Error Handling**: Comprehensive status reporting and graceful failure handling
+
+### Flexible Data Management
+- **EFS Control**: Optional EFS data backup/restore for faster operations
+- **Status Awareness**: Tracks and reports app states (InService, Failed, Deleted, etc.)
+- **Resource Mapping**: Complete ARN mapping for seamless resource migration
+
+### User Profile Support
+- **Enhanced SSO Extraction**: Supports both simple and email-based user profile formats
+- **Automatic Detection**: Handles formats like `user-abc123` and `priv-user-domain-edu-0123`
+- **Graceful Handling**: Manages existing resources during resume operations
 
 ## Prerequisites
 
@@ -109,7 +128,9 @@ python scripts/backup_domain_data.py \
   --domain-id d-xxxxxxxxxxxx \
   --s3-bucket your-backup-bucket \
   --s3-prefix sagemaker-migration \
-  --config-dir ./migration_data
+  --config-dir ./migration_data \
+  [--backup-efs] \
+  [--no-backup-efs]
 ```
 
 **Parameters:**
@@ -117,6 +138,8 @@ python scripts/backup_domain_data.py \
 - `--s3-bucket` (required): S3 bucket name for backup storage
 - `--s3-prefix` (optional): S3 prefix for organizing backup data
 - `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
+- `--backup-efs` (optional): Backup EFS data (default: True)
+- `--no-backup-efs` (optional): Skip EFS data backup
 
 **Output Files:**
 - `migration_data/backup_status.json`: Backup operation status and any failures
@@ -124,15 +147,24 @@ python scripts/backup_domain_data.py \
 **What This Does:**
 1. Creates lifecycle configurations that sync data to S3
 2. Attaches lifecycle configurations to the domain
-3. Restarts all active JupyterLab and CodeEditor apps
+3. Restarts all InService JupyterLab and CodeEditor apps (skips Failed, Deleted, or other non-InService apps)
 4. Waits for apps to complete the backup process
+5. Optionally excludes EFS data (`/home/sagemaker-user/user-default-efs`) if `--no-backup-efs` is specified
 
-**Example:**
+**Examples:**
 ```bash
+# Backup with EFS data (default)
 python scripts/backup_domain_data.py \
   --domain-id d-abc123def456 \
   --s3-bucket my-sagemaker-backups \
   --s3-prefix migration-2025-11
+
+# Backup without EFS data
+python scripts/backup_domain_data.py \
+  --domain-id d-abc123def456 \
+  --s3-bucket my-sagemaker-backups \
+  --s3-prefix migration-2025-11 \
+  --no-backup-efs
 ```
 
 **⚠️ Important:** This phase will restart all active apps. Users will be temporarily disconnected.
@@ -194,6 +226,7 @@ python scripts/recreate_domain.py \
 **Parameters:**
 - `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
 - `--new-domain-name` (optional): Name for the new domain (default: original name with timestamp)
+- `--resume-domain-id` (optional): Resume from existing domain ID instead of creating new domain
 
 **Output Files:**
 - `migration_data/recreation_mapping.json`: Mapping of old to new resource ARNs
@@ -206,12 +239,62 @@ python scripts/recreate_domain.py \
 5. Creates all spaces with original owners and settings
 6. Generates a mapping file for ARN translation
 
-**Example:**
+**Examples:**
 ```bash
+# Create new domain
 python scripts/recreate_domain.py --new-domain-name studio-domain-prod
+
+# Resume from existing domain (if script failed after domain creation)
+python scripts/recreate_domain.py --resume-domain-id d-xyz789ghi012
 ```
 
-### Phase 5: Retagging
+**Resume Functionality:**
+If the recreation script fails after creating the domain, you can resume from the existing domain instead of deleting and recreating it:
+- Validates the domain exists and is accessible
+- Skips domain creation and proceeds with user profiles and spaces
+- Handles existing user profiles and spaces gracefully
+- Still generates complete resource mapping
+
+### Phase 5: User Assignment
+
+Assign users to the new SageMaker Studio domain by creating Identity Center application assignments.
+
+**Command:**
+```bash
+python scripts/assign_users_to_domain.py \
+  --domain-id d-yyyyyyyyyyyy \
+  --identity-store-id d-92679c0362 \
+  --config-dir ./migration_data
+```
+
+**Parameters:**
+- `--domain-id` (required): The ID of the new domain
+- `--identity-store-id` (required): Identity Center identity store ID
+- `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
+
+**Output Files:**
+- `migration_data/user_assignment_status.json`: User assignment operation status and any failures
+
+**What This Does:**
+1. Loads user profiles from the configuration files
+2. Extracts SSO usernames from user profile names
+3. Uses Identity Center get_user_id API to find users by username
+4. Creates application assignments for each user using SSO Admin APIs
+5. Provides detailed status reporting for successful and failed assignments
+
+**Example:**
+```bash
+python scripts/assign_users_to_domain.py \
+  --domain-id d-xyz789ghi012 \
+  --identity-store-id d-92679c0362
+```
+
+**⚠️ Important:** 
+- Users must exist in the new Identity Center instance before running this script
+- The identity store ID can be found in the AWS Identity Center console
+- This script should be run after domain recreation but before users attempt to access the domain
+
+### Phase 6: Retagging
 
 Update tags on SageMaker resources to reference the new domain.
 
@@ -243,7 +326,7 @@ python scripts/retag_resources.py \
   --new-domain-id d-xyz789ghi012
 ```
 
-### Phase 6: Restoration
+### Phase 7: Restoration
 
 Restore user data from S3 back to the new domain.
 
@@ -253,7 +336,9 @@ python scripts/restore_domain_data.py \
   --domain-id d-yyyyyyyyyyyy \
   --s3-bucket your-backup-bucket \
   --s3-prefix sagemaker-migration \
-  --config-dir ./migration_data
+  --config-dir ./migration_data \
+  [--backup-efs] \
+  [--no-backup-efs]
 ```
 
 **Parameters:**
@@ -261,6 +346,8 @@ python scripts/restore_domain_data.py \
 - `--s3-bucket` (required): S3 bucket name containing backup data
 - `--s3-prefix` (optional): S3 prefix where backup data is stored
 - `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
+- `--backup-efs` (optional): EFS data was backed up (default: True)
+- `--no-backup-efs` (optional): EFS data was not backed up
 
 **Output Files:**
 - `migration_data/restoration_status.json`: Restoration operation status and any failures
@@ -268,15 +355,24 @@ python scripts/restore_domain_data.py \
 **What This Does:**
 1. Creates lifecycle configurations that sync data from S3
 2. Attaches lifecycle configurations to the new domain
-3. Starts apps for all spaces to trigger data restoration
+3. Starts apps for all spaces in parallel to trigger data restoration
 4. Waits for apps to complete the restoration process
+5. Skips restoring EFS data if `--no-backup-efs` is specified (must match backup settings)
 
-**Example:**
+**Examples:**
 ```bash
+# Restore with EFS data (default)
 python scripts/restore_domain_data.py \
   --domain-id d-xyz789ghi012 \
   --s3-bucket my-sagemaker-backups \
   --s3-prefix migration-2025-11
+
+# Restore without EFS data (if backup was done with --no-backup-efs)
+python scripts/restore_domain_data.py \
+  --domain-id d-xyz789ghi012 \
+  --s3-bucket my-sagemaker-backups \
+  --s3-prefix migration-2025-11 \
+  --no-backup-efs
 ```
 
 ## Script Reference
@@ -290,16 +386,24 @@ Captures all configuration details of an existing SageMaker Studio domain.
 python scripts/discover_domain.py --domain-id <domain-id> [--output-dir <path>]
 ```
 
+**Key Features:**
+- Captures all JupyterLab and CodeEditor apps regardless of status
+- Detailed status reporting (InService, Failed, Deleted, etc.)
+- Captures ResourceSpecs for use in backup and restore operations
+- Comprehensive logging of app states
+
 **Required IAM Permissions:**
 - `sagemaker:DescribeDomain`
 - `sagemaker:ListUserProfiles`
 - `sagemaker:DescribeUserProfile`
 - `sagemaker:ListSpaces`
 - `sagemaker:DescribeSpace`
+- `sagemaker:ListApps`
+- `sagemaker:DescribeApp`
 
 ### backup_domain_data.py
 
-Creates lifecycle configurations to backup user data to S3 and restarts apps.
+Creates lifecycle configurations to backup user data to S3 and restarts InService apps.
 
 **Usage:**
 ```bash
@@ -307,8 +411,16 @@ python scripts/backup_domain_data.py \
   --domain-id <domain-id> \
   --s3-bucket <bucket-name> \
   [--s3-prefix <prefix>] \
-  [--config-dir <path>]
+  [--config-dir <path>] \
+  [--backup-efs] \
+  [--no-backup-efs]
 ```
+
+**Key Features:**
+- Only processes InService apps (skips Failed, Deleted, Deleting apps)
+- Parallel app creation with throttling to avoid API limits
+- Optional EFS data exclusion for faster backups
+- Detailed status reporting by app state
 
 **Required IAM Permissions:**
 - `sagemaker:CreateStudioLifecycleConfig`
@@ -329,8 +441,15 @@ Recreates the domain, user profiles, and spaces in the new organizational contex
 ```bash
 python scripts/recreate_domain.py \
   [--config-dir <path>] \
-  [--new-domain-name <name>]
+  [--new-domain-name <name>] \
+  [--resume-domain-id <domain-id>]
 ```
+
+**Key Features:**
+- Resume functionality for failed recreations
+- Enhanced SSO username extraction for email-based formats
+- Handles existing user profiles and spaces gracefully
+- Validates domain status before proceeding
 
 **Required IAM Permissions:**
 - `sagemaker:CreateDomain`
@@ -377,8 +496,16 @@ python scripts/restore_domain_data.py \
   --domain-id <domain-id> \
   --s3-bucket <bucket-name> \
   [--s3-prefix <prefix>] \
-  [--config-dir <path>]
+  [--config-dir <path>] \
+  [--backup-efs] \
+  [--no-backup-efs]
 ```
+
+**Key Features:**
+- Parallel app creation with throttling to avoid API limits
+- Filters out ResourceSpecs from failed apps in original domain
+- Optional EFS data exclusion (must match backup settings)
+- Comprehensive status reporting
 
 **Required IAM Permissions:**
 - `sagemaker:CreateStudioLifecycleConfig`
@@ -387,6 +514,48 @@ python scripts/restore_domain_data.py \
 - `sagemaker:DescribeApp`
 - `s3:GetObject`
 - `s3:ListBucket`
+
+### assign_users_to_domain.py
+
+Assigns users to the new SageMaker Studio domain by creating Identity Center application assignments.
+
+**Usage:**
+```bash
+python scripts/assign_users_to_domain.py \
+  --domain-id <domain-id> \
+  --identity-store-id <identity-store-id> \
+  [--config-dir <path>]
+```
+
+**Parameters:**
+- `--domain-id` (required): The ID of the new domain
+- `--identity-store-id` (required): Identity Center identity store ID
+- `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
+- `--log-level` (optional): Logging level (default: INFO)
+
+**Key Features:**
+- Uses IdentityStore get_user_id API to find users by username
+- Validates user IDs before creating assignments
+- Uses SSO Admin APIs to create application assignments
+- Provides detailed logging and error handling
+- Includes rate limiting to avoid API throttling
+
+**Required IAM Permissions:**
+- `sso-admin:CreateApplicationAssignment`
+- `identitystore:GetUserId`
+- `sagemaker:DescribeDomain`
+
+**Use Cases:**
+- Assigning users to the new domain after recreation
+- Ensuring all users have proper access to the migrated domain
+- Bulk user assignment with comprehensive error reporting
+
+**Example:**
+```bash
+python scripts/assign_users_to_domain.py \
+  --domain-id d-xyz789ghi012 \
+  --identity-store-id d-92679c0362
+```
 
 ### delete_domain_apps.py
 
@@ -518,6 +687,24 @@ python scripts/delete_domain_apps.py --domain-id d-abc123def456
 }
 ```
 
+#### User Assignment Phase
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:DescribeDomain",
+        "sso-admin:CreateApplicationAssignment",
+        "identitystore:GetUserId"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
 #### Retagging Phase
 ```json
 {
@@ -616,7 +803,8 @@ A single IAM policy combining all required permissions for the entire migration 
       "Action": [
         "sso-admin:ListApplications",
         "sso-admin:CreateApplicationAssignment",
-        "identitystore:ListUsers"
+        "identitystore:ListUsers",
+        "identitystore:GetUserId"
       ],
       "Resource": "*"
     },
@@ -722,6 +910,19 @@ This migration tool **does not support** the following SageMaker Studio applicat
 2. Check Identity Center to ensure the user assignment was successful
 3. Verify the user exists in the new Identity Center instance
 4. Manually create the user profile if automatic creation fails after 15 minutes
+
+#### Issue: "User not found in Identity Center" during user assignment
+
+**Cause:** The user doesn't exist in the new Identity Center instance or the username format doesn't match.
+
+**Solution:**
+1. Verify users exist in the new Identity Center instance
+2. Check that usernames match the format expected by the script
+3. Verify the identity store ID is correct:
+   ```bash
+   aws identitystore list-users --identity-store-id d-92679c0362
+   ```
+4. Find the correct identity store ID in the AWS Identity Center console under "Settings"
 
 #### Issue: "Access Denied" errors during recreation
 
