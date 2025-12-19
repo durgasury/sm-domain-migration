@@ -25,22 +25,19 @@ When an AWS account moves between AWS Organizations, SSO-based SageMaker Studio 
 5. **Retagging** SageMaker resources to reference the new domain
 6. **Restoring** user data from S3 back to the new domain
 
+> [!IMPORTANT]
+> This is not meant to be used in production scenarios. Use this repository as a starting point and to understand the migration process. Test it out in a dev/staging account first. Please work with your AWS team if you need support in migrating a Studio domain with active users.
+
 ## Key Features
 
-### Enhanced Reliability
 - **Parallel Processing**: Apps are created in parallel with throttling to avoid API limits
 - **Resume Functionality**: Resume domain recreation from existing domains if the script fails
 - **Smart App Filtering**: Only processes InService apps, skips Failed/Deleted apps
 - **Robust Error Handling**: Comprehensive status reporting and graceful failure handling
-
-### Flexible Data Management
 - **EFS Control**: Optional EFS data backup/restore for faster operations
 - **Status Awareness**: Tracks and reports app states (InService, Failed, Deleted, etc.)
 - **Resource Mapping**: Complete ARN mapping for seamless resource migration
-
-### User Profile Support
 - **Enhanced SSO Extraction**: Supports both simple and email-based user profile formats
-- **Automatic Detection**: Handles formats like `user-abc123` and `priv-user-domain-edu-0123`
 - **Graceful Handling**: Manages existing resources during resume operations
 
 ## Prerequisites
@@ -62,7 +59,7 @@ When an AWS account moves between AWS Organizations, SSO-based SageMaker Studio 
 
 - **Authentication Mode**: SSO (Single Sign-On) mode only
 - **App Types**: JupyterLab and CodeEditor
-- **Storage**: Default EFS volumes only
+- **Storage**: Default EFS and EBS volumes only
 
 ## Installation
 
@@ -269,7 +266,7 @@ python scripts/assign_users_to_domain.py \
 
 **Parameters:**
 - `--domain-id` (required): The ID of the new domain
-- `--identity-store-id` (required): Identity Center identity store ID
+- `--identity-store-id` (required): Identity Center identity store ID 
 - `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
 
 **Output Files:**
@@ -293,6 +290,7 @@ python scripts/assign_users_to_domain.py \
 - Users must exist in the new Identity Center instance before running this script
 - The identity store ID can be found in the AWS Identity Center console
 - This script should be run after domain recreation but before users attempt to access the domain
+- This step can also be done manually via the console if needed
 
 ### Phase 6: Retagging
 
@@ -1089,7 +1087,3 @@ Perform basic functionality tests:
 ## Support
 
 For issues, questions, or contributions, please refer to the project repository or contact your AWS support team.
-
-## License
-
-[Add your license information here]
