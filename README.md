@@ -16,6 +16,7 @@ A comprehensive Python-based tool for migrating Amazon SageMaker Studio domains 
 
 ## Additional Documentation
 
+- [Script Reference](SCRIPT_REFERENCE.md) - Detailed documentation for each migration script
 - [IAM Permissions](IAM_PERMISSIONS.md) - Detailed IAM policies and permissions required for each migration phase
 - [Troubleshooting Guide](TROUBLESHOOTING.md) - Common issues, solutions, and debugging procedures
 
@@ -91,6 +92,32 @@ aws configure
 4. Create an S3 bucket for backups:
 ```bash
 aws s3 mb s3://your-backup-bucket-name
+```
+
+## Migration Process Flow
+
+```mermaid
+flowchart TD
+    A[Phase 1: Discovery<br/>discover_domain.py] --> B[Phase 2: Backup<br/>backup_domain_data.py]
+    B --> C{Optional: Delete Apps<br/>delete_domain_apps.py}
+    C -.-> D[Phase 3: Account Migration<br/>Manual Step]
+    B --> D
+    D --> E[Phase 4: Recreation<br/>recreate_domain.py]
+    E --> F[Phase 5: User Assignment<br/>assign_users_to_domain.py]
+    F --> G[Phase 6: Retagging<br/>retag_resources.py]
+    G --> H[Phase 7: Restoration<br/>restore_domain_data.py]
+    
+    style A fill:#e3f2fd,stroke:#1976d2,stroke-width:2px,color:#000
+    style B fill:#e8f5e9,stroke:#388e3c,stroke-width:2px,color:#000
+    style C fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#000
+    style D fill:#fce4ec,stroke:#c2185b,stroke-width:2px,color:#000
+    style E fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style F fill:#e0f2f1,stroke:#00796b,stroke-width:2px,color:#000
+    style G fill:#fffde7,stroke:#f9a825,stroke-width:2px,color:#000
+    style H fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#000
+    
+    classDef optional stroke-dasharray: 5 5
+    class C optional
 ```
 
 ## Migration Process
@@ -380,221 +407,7 @@ python scripts/restore_domain_data.py \
 
 ## Script Reference
 
-### discover_domain.py
-
-Captures all configuration details of an existing SageMaker Studio domain.
-
-**Usage:**
-```bash
-python scripts/discover_domain.py --domain-id <domain-id> [--output-dir <path>]
-```
-
-**Key Features:**
-- Captures all JupyterLab and CodeEditor apps regardless of status
-- Detailed status reporting (InService, Failed, Deleted, etc.)
-- Captures ResourceSpecs for use in backup and restore operations
-- Comprehensive logging of app states
-
-**Required IAM Permissions:**
-- `sagemaker:DescribeDomain`
-- `sagemaker:ListUserProfiles`
-- `sagemaker:DescribeUserProfile`
-- `sagemaker:ListSpaces`
-- `sagemaker:DescribeSpace`
-- `sagemaker:ListApps`
-- `sagemaker:DescribeApp`
-
-### backup_domain_data.py
-
-Creates lifecycle configurations to backup user data to S3 and restarts InService apps.
-
-**Usage:**
-```bash
-python scripts/backup_domain_data.py \
-  --domain-id <domain-id> \
-  --s3-bucket <bucket-name> \
-  [--s3-prefix <prefix>] \
-  [--config-dir <path>] \
-  [--backup-efs] \
-  [--no-backup-efs]
-```
-
-**Key Features:**
-- Only processes InService apps (skips Failed, Deleted, Deleting apps)
-- Parallel app creation with throttling to avoid API limits
-- Optional EFS data exclusion for faster backups
-- Detailed status reporting by app state
-
-**Required IAM Permissions:**
-- `sagemaker:CreateStudioLifecycleConfig`
-- `sagemaker:UpdateDomain`
-- `sagemaker:ListApps`
-- `sagemaker:DescribeApp`
-- `sagemaker:DeleteApp`
-- `sagemaker:CreateApp`
-- `s3:PutObject`
-- `s3:GetObject`
-- `s3:ListBucket`
-
-### recreate_domain.py
-
-Recreates the domain, user profiles, and spaces in the new organizational context.
-
-**Usage:**
-```bash
-python scripts/recreate_domain.py \
-  [--config-dir <path>] \
-  [--new-domain-name <name>] \
-  [--resume-domain-id <domain-id>]
-```
-
-**Key Features:**
-- Resume functionality for failed recreations
-- Enhanced SSO username extraction for email-based formats
-- Handles existing user profiles and spaces gracefully
-- Validates domain status before proceeding
-
-**Required IAM Permissions:**
-- `sagemaker:CreateDomain`
-- `sagemaker:DescribeDomain`
-- `sagemaker:DescribeUserProfile`
-- `sagemaker:UpdateUserProfile`
-- `sagemaker:CreateSpace`
-- `sagemaker:DescribeSpace`
-- `sso-admin:ListApplications`
-- `sso-admin:CreateApplicationAssignment`
-- `identitystore:ListUsers`
-- `iam:PassRole`
-
-### retag_resources.py
-
-Updates tags on SageMaker resources to reference the new domain.
-
-**Usage:**
-```bash
-python scripts/retag_resources.py \
-  --old-domain-id <old-id> \
-  --new-domain-id <new-id> \
-  [--config-dir <path>]
-```
-
-**Required IAM Permissions:**
-- `sagemaker:ListTrainingJobs`
-- `sagemaker:DescribeTrainingJob`
-- `sagemaker:ListPipelines`
-- `sagemaker:DescribePipeline`
-- `sagemaker:ListEndpoints`
-- `sagemaker:DescribeEndpoint`
-- `sagemaker:ListTags`
-- `sagemaker:AddTags`
-- `sagemaker:DeleteTags`
-
-### restore_domain_data.py
-
-Creates lifecycle configurations to restore user data from S3 and starts all spaces.
-
-**Usage:**
-```bash
-python scripts/restore_domain_data.py \
-  --domain-id <domain-id> \
-  --s3-bucket <bucket-name> \
-  [--s3-prefix <prefix>] \
-  [--config-dir <path>] \
-  [--backup-efs] \
-  [--no-backup-efs]
-```
-
-**Key Features:**
-- Parallel app creation with throttling to avoid API limits
-- Filters out ResourceSpecs from failed apps in original domain
-- Optional EFS data exclusion (must match backup settings)
-- Comprehensive status reporting
-
-**Required IAM Permissions:**
-- `sagemaker:CreateStudioLifecycleConfig`
-- `sagemaker:UpdateDomain`
-- `sagemaker:CreateApp`
-- `sagemaker:DescribeApp`
-- `s3:GetObject`
-- `s3:ListBucket`
-
-### assign_users_to_domain.py
-
-Assigns users to the new SageMaker Studio domain by creating Identity Center application assignments.
-
-**Usage:**
-```bash
-python scripts/assign_users_to_domain.py \
-  --domain-id <domain-id> \
-  --identity-store-id <identity-store-id> \
-  [--config-dir <path>]
-```
-
-**Parameters:**
-- `--domain-id` (required): The ID of the new domain
-- `--identity-store-id` (required): Identity Center identity store ID
-- `--config-dir` (optional): Directory containing configuration files (default: `./migration_data`)
-- `--log-level` (optional): Logging level (default: INFO)
-
-**Key Features:**
-- Uses IdentityStore get_user_id API to find users by username
-- Validates user IDs before creating assignments
-- Uses SSO Admin APIs to create application assignments
-- Provides detailed logging and error handling
-- Includes rate limiting to avoid API throttling
-
-**Required IAM Permissions:**
-- `sso-admin:CreateApplicationAssignment`
-- `identitystore:GetUserId`
-- `sagemaker:DescribeDomain`
-
-**Use Cases:**
-- Assigning users to the new domain after recreation
-- Ensuring all users have proper access to the migrated domain
-- Bulk user assignment with comprehensive error reporting
-
-**Example:**
-```bash
-python scripts/assign_users_to_domain.py \
-  --domain-id d-xyz789ghi012 \
-  --identity-store-id d-92679c0362
-```
-
-### delete_domain_apps.py
-
-Deletes all JupyterLab and CodeEditor apps in a domain for cost savings.
-
-**Usage:**
-```bash
-python scripts/delete_domain_apps.py \
-  --domain-id <domain-id> \
-  [--dry-run] \
-  [--config-dir <path>]
-```
-
-**Parameters:**
-- `--domain-id` (required): The ID of the domain
-- `--dry-run` (optional): Show what would be deleted without actually deleting
-- `--config-dir` (optional): Directory for output files (default: `./migration_data`)
-- `--log-level` (optional): Logging level (default: INFO)
-
-**Required IAM Permissions:**
-- `sagemaker:ListApps`
-- `sagemaker:DeleteApp`
-
-**Use Cases:**
-- Cost savings during account migration when apps are not actively being used
-- Cleaning up apps before domain deletion
-- Forcing all users to restart apps with new configurations
-
-**Example:**
-```bash
-# Preview what would be deleted
-python scripts/delete_domain_apps.py --domain-id d-abc123def456 --dry-run
-
-# Actually delete all apps
-python scripts/delete_domain_apps.py --domain-id d-abc123def456
-```
+For detailed information about each script, including usage, features, parameters, and required IAM permissions, see [SCRIPT_REFERENCE.md](SCRIPT_REFERENCE.md).
 
 ## IAM Permissions
 
